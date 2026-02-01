@@ -106,19 +106,22 @@ class DatabaseManager:
                 """, market_reg_data)
             conn.commit()
 
-    def get_top_active_tickers(self, limit=10) -> List[str]:
+    def get_top_active_tickers(self, limit=50) -> List[str]:
         """
-        Returns active CRYPTO, ECON, and MISC tickers with highest volume.
-        Strictly filters out ESPORTS.
+        Returns the top active tickers based on volume, filtered for liquidity quality.
+        - Ignores markets with wide spreads (spread > 10).
+        - Ignores dead markets (volume <= 500).
+        - Fetches the top `limit` tickers by volume after filtering.
         """
         query = """
-            SELECT s.ticker 
+            SELECT s.ticker
             FROM market_snapshots s
             JOIN market_registry m ON s.ticker = m.ticker
             JOIN series_registry sr ON m.series_ticker = sr.series_ticker
-            WHERE sr.category IN ('CRYPTO', 'ECON', 'MISC') 
-              AND s.status = 'active'
+            WHERE s.status = 'active'
               AND s.timestamp > (strftime('%s', 'now') - 3600)
+              AND s.spread <= 10
+              AND s.volume > 500
             GROUP BY s.ticker
             ORDER BY s.volume DESC
             LIMIT ?
