@@ -88,26 +88,6 @@ class MarketHarvester:
             if category == 'ESPORTS':
                 continue
 
-            # Discovery Log - only log interesting finds to reduce noise
-            if category != 'ESPORTS' and category != 'MISC':
-                self.logger.log_info(
-                    f"Harvester: Found valuable {category} market: {ticker}")
-
-            # Prepare Series Data (series_ticker, title, category, frequency)
-            series_data.append((
-                series_ticker,
-                getattr(market, 'title', 'Unknown'),
-                category,
-                getattr(market, 'frequency', 'unknown')
-            ))
-
-            # Prepare Market Registry Data (ticker, series_ticker, expiration)
-            market_registry_data.append((
-                ticker,
-                series_ticker,
-                str(getattr(market, 'expiration_time', ''))
-            ))
-
             # Prepare Snapshot Data (ticker, time, bid, ask, spread, vol, oi, status)
             yes_bid = getattr(market, 'yes_bid', 0)
             yes_ask = getattr(market, 'yes_ask', 0)
@@ -117,6 +97,11 @@ class MarketHarvester:
                 spread = yes_ask - yes_bid
             else:
                 spread = 99
+
+            # Discovery Log - log any market with a tight spread, regardless of category
+            if spread <= 5:
+                self.logger.log_info(
+                    f"Harvester: Found high-liquidity '{category}' market: {ticker} (Spread: {spread})")
 
             snapshot_data.append((
                 ticker,

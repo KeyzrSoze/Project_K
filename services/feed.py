@@ -6,6 +6,7 @@ from kalshi_python.api import markets_api
 from config import AppConfig
 from utils.logger import Logger
 from services.db import DatabaseManager
+import time
 
 
 class MarketFeed:
@@ -54,13 +55,13 @@ class MarketFeed:
 
     async def get_active_tickers(self) -> List[str]:
         """
-        Retrieves the top 10 most active tickers from the local database,
-        excluding 'ESPORTS' markets.
+        Retrieves the top 50 most active tickers from the local database,
+        based on metrics defined in the DatabaseManager.
         """
         self.logger.log_info("Querying database for top active tickers...")
         try:
-            # Query the database for the top 10 active tickers
-            top_tickers = self.db.get_top_active_tickers(limit=10)
+            # This call is now directed to the optimized, centralized query in db.py
+            top_tickers = self.db.get_top_active_tickers(limit=50)
 
             if top_tickers:
                 self.logger.log_info(
@@ -72,54 +73,61 @@ class MarketFeed:
                 return []
 
         except Exception as e:
-            self.logger.log_error(f"Database query for active tickers failed: {e}")
+            self.logger.log_error(
+                f"Database query for active tickers failed: {e}")
             return []
 
     async def poll_orderbook(self, ticker: str) -> Dict[str, Any]:
-        """Fetch Level 2 Order Book Data."""
-        if not self.is_connected:
-            return {}
-
+        """
+        Retrieves a comprehensive, enriched market snapshot from the local DB,
+        joining across tables to get metadata required for feature engineering and recording.
+        """
+        query = """
+            SELECT
+                s.ticker, s.timestamp, s.bid, s.ask, s.spread, s.volume, s.status,
+                m.series_ticker,
+                sr.category
+            FROM market_snapshots s
+            LEFT JOIN market_registry m ON s.ticker = m.ticker
+            LEFT JOIN series_registry sr ON m.series_ticker = sr.series_ticker
+            WHERE s.ticker = ?
+            ORDER BY s.timestamp DESC
+            LIMIT 1
+        """
         try:
-            # 1. Get the raw response object
-            # Note: We use 'get_market_orderbook' as confirmed by your diagnostic
-            response = self.market_api.get_market_orderbook(ticker, depth=5)
+            loop = asyncio.get_running_loop()
+            row = await loop.run_in_executor(
+                None,
+                lambda: self._fetch_snapshot_from_db(query, ticker)
+            )
 
-            # 2. Extract the inner orderbook object
-            # Based on diagnostic, the attribute is lowercase 'orderbook'
-            if hasattr(response, 'orderbook'):
-                ob = response.orderbook
+            if row:
+                # The FeatureExtractor expects bid/ask counts. Since they are not in the
+                # DB, we will pass them as 0. The OBI will be 0, but other features will work.
+                return {
+                    "ticker": row['ticker'],
+                    "timestamp": row['timestamp'],
+                    "bid": row['bid'],
+                    "ask": row['ask'],
+                    "spread": row['spread'],
+                    "volume": row['volume'],
+                    "status": row.get('status', 'unknown'),
+                    "series_ticker": row.get('series_ticker', 'unknown'),
+                    "category": row.get('category', 'MISC'),
+                    "bid_count": 0,  # Placeholder for OBI calculation
+                    "ask_count": 0  # Placeholder for OBI calculation
+                }
             else:
-                # Fallback in case structure varies
-                ob = response
-
-            # 3. Extract Liquidity (The var_true/var_false Fix)
-            # var_true = Bids for YES
-            # var_false = Bids for NO (which we convert to Asks for YES)
-
-            yes_bids = getattr(ob, 'var_true', []) or []
-            no_bids = getattr(ob, 'var_false', []) or []
-
-            # 4. Calculate Prices
-            # best_yes_bid is simply the top price in var_true
-            best_bid = yes_bids[0][0] if yes_bids else 0
-
-            # best_yes_ask is (100 - best_no_bid)
-            best_no_bid = no_bids[0][0] if no_bids else 0
-            best_ask = 100 - best_no_bid if best_no_bid > 0 else 100
-
-            spread = best_ask - best_bid
-
-            # Log it
-            self.logger.log_market(ticker, best_bid, best_ask, spread)
-
-            return {
-                "ticker": ticker,
-                "bid": best_bid,
-                "ask": best_ask,
-                "spread": spread
-            }
+                self.logger.log_warn(f"No snapshot found in DB for {ticker}")
+                return {}
 
         except Exception as e:
-            self.logger.log_warn(f"Poll failed for {ticker}: {e}")
+            self.logger.log_error(f"DB poll failed for {ticker}: {e}")
             return {}
+
+    def _fetch_snapshot_from_db(self, query: str, ticker: str) -> Optional[Dict[str, Any]]:
+        """Helper to run the SQL query for a single row."""
+        with self.db.get_connection() as conn:
+            cursor = conn.cursor()
+            row = cursor.execute(query, (ticker,)).fetchone()
+            return dict(row) if row else None

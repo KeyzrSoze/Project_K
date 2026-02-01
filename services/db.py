@@ -119,7 +119,7 @@ class DatabaseManager:
             JOIN market_registry m ON s.ticker = m.ticker
             JOIN series_registry sr ON m.series_ticker = sr.series_ticker
             WHERE s.status = 'active'
-              AND s.timestamp > (strftime('%s', 'now') - 3600)
+              AND s.timestamp > (strftime('%s', 'now') - 120)
               AND s.spread <= 10
               AND s.volume > 500
             GROUP BY s.ticker
