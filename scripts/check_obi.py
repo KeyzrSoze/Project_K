@@ -1,8 +1,10 @@
+import argparse
+import time
 import pandas as pd
 from services.db import DatabaseManager, DB_PATH
 
 
-def check_obi_data():
+def check_obi_data(show_count: bool = False):
     db = DatabaseManager()
     print(f"[check_obi] Using DB: {DB_PATH}")
 
@@ -37,7 +39,30 @@ def check_obi_data():
 
     except Exception as e:
         print(f"[ERROR] Could not read OBI data: {e}")
+        return
+
+    if show_count:
+        try:
+            now = time.time()
+            with db.get_connection() as conn:
+                total = conn.execute(
+                    "SELECT COUNT(*) as total FROM market_obi"
+                ).fetchone()["total"]
+                recent = conn.execute(
+                    "SELECT COUNT(DISTINCT ticker) as recent FROM market_obi WHERE timestamp >= ?",
+                    (now - 60,)
+                ).fetchone()["recent"]
+            print(f"[check_obi] Counts: total_rows={total}, tickers_updated_60s={recent}")
+        except Exception as e:
+            print(f"[ERROR] Could not read OBI counts: {e}")
 
 
 if __name__ == "__main__":
-    check_obi_data()
+    parser = argparse.ArgumentParser(description="Inspect recent OBI rows.")
+    parser.add_argument(
+        "--count",
+        action="store_true",
+        help="Print total market_obi rows and tickers updated in the last 60 seconds.",
+    )
+    args = parser.parse_args()
+    check_obi_data(show_count=args.count)

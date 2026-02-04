@@ -68,6 +68,7 @@ class ObiTracker:
         self._last_idle_log_ts: float = 0.0
         self._last_global_cooldown_log_ts: float = 0.0
         self._last_db_error_log_ts: float = 0.0
+        self._last_429_log_ts: Dict[str, float] = {}
 
     def _base_host(self) -> str:
         return (
@@ -229,10 +230,18 @@ class ObiTracker:
             body = e.read() if hasattr(e, "read") else b""
             text = body.decode("utf-8", errors="replace") if body else ""
             retry_after = self._parse_retry_after(getattr(e, "headers", None))
-            self._log_throttled(
-                f"[ObiTracker] Orderbook HTTP {e.code} for {ticker}: {text[:500]}",
-                "_last_http_error_log_ts",
-            )
+            if e.code == 429:
+                now_ts = time.time()
+                last_ts = self._last_429_log_ts.get(ticker, 0.0)
+                if now_ts - last_ts >= 10.0:
+                    self._last_429_log_ts[ticker] = now_ts
+                    logger.log_warn(
+                        f"[ObiTracker] Orderbook HTTP 429 for {ticker}: {text[:500]}")
+            else:
+                self._log_throttled(
+                    f"[ObiTracker] Orderbook HTTP {e.code} for {ticker}: {text[:500]}",
+                    "_last_http_error_log_ts",
+                )
             return None, e.code, retry_after
         except urllib.error.URLError as e:
             self._log_throttled(
@@ -370,17 +379,19 @@ class ObiTracker:
         self._ticker_429_counts[ticker] = min(count, 6)
 
         backoff = self._backoff_base * (2 ** (self._ticker_429_counts[ticker] - 1))
-        if retry_after is not None:
-            backoff = max(backoff, retry_after)
         backoff = min(backoff, self._backoff_cap)
-        backoff += random.uniform(0.0, self._jitter_max)
+        cooldown = retry_after if retry_after is not None else backoff
+        cooldown = min(cooldown, self._backoff_cap)
+        cooldown *= random.uniform(0.8, 1.2)
+        cooldown = max(self._min_ticker_interval, cooldown)
 
-        self._ticker_next_allowed[ticker] = now + max(self._min_ticker_interval, backoff)
-        self._global_cooldown_until = max(self._global_cooldown_until, now + min(backoff, 0.5))
+        self._ticker_next_allowed[ticker] = now + cooldown
+        self._global_cooldown_until = max(self._global_cooldown_until, now + min(cooldown, 0.5))
         self._global_next_request_ts = max(self._global_next_request_ts, now + 1.0)
 
-        global_cooldown = retry_after if retry_after is not None else min(backoff, 30.0)
+        global_cooldown = retry_after if retry_after is not None else min(cooldown, 30.0)
         global_cooldown = max(2.0, global_cooldown)
+        global_cooldown *= random.uniform(0.8, 1.2)
         try:
             current = self.db.get_rate_limit_cooldown_until()
             target = now + global_cooldown
