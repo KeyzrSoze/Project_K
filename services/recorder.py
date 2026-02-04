@@ -78,8 +78,11 @@ class AsyncMarketRecorder:
 
         df = pd.DataFrame(data_batch)
 
-        # Ensure timestamp is in datetime format and create date for partitioning
-        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        # FIXED: Explicitly tell Pandas these are seconds (Unix Epoch), not nanoseconds.
+        # This prevents the "Time Machine" bug where dates revert to 1970.
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s')
+
+        # Create date column for partitioning
         df['date'] = df['timestamp'].dt.date
 
         try:
@@ -88,7 +91,7 @@ class AsyncMarketRecorder:
 
             # Write to partitioned Parquet dataset.
             # This creates a directory structure like:
-            # /data/training/date=2026-01-31/category=CRYPTO/some-file.parquet
+            # /data/training/date=2026-02-01/category=CRYPTO/some-file.parquet
             pq.write_to_dataset(
                 table,
                 root_path=self.save_path,

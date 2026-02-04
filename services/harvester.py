@@ -1,6 +1,8 @@
 import asyncio
+import random
 import time
-from typing import List, Any
+from email.utils import parsedate_to_datetime
+from typing import List, Any, Optional, Tuple
 from kalshi_python.api import markets_api
 from services.db import DatabaseManager
 from utils.logger import Logger
@@ -9,189 +11,207 @@ from kalshi_python import ApiClient
 
 class MarketHarvester:
     """
-    A background service that fetches market data from the API and writes it to
-    a local SQLite database, ensuring the async event loop is not blocked.
+    A dedicated "Discovery Engine" that scans all markets and populates the
+    'market_metrics' table with volume, open interest, and spread data.
+    The high-frequency tracking has been moved to a separate service.
     """
 
     def __init__(self, api_client: ApiClient, logger: Logger):
-        """
-        Initializes the harvester.
-        :param api_client: An authenticated Kalshi API client.
-        :param logger: An instance of the application logger.
-        """
         self.market_api = markets_api.MarketsApi(api_client)
         self.logger = logger
         self.db = DatabaseManager()
+        self._last_global_cooldown_log_ts: float = 0.0
+        self._harvest_429_count: int = 0
+        self._last_harvest_429_ts: float = 0.0
 
     def _categorize(self, ticker: str, series_ticker: str) -> str:
-        """
-        Categorizes markets based on strict ticker patterns to ensure data quality.
-
-        - ESPORTS: Filters out high-volume/low-quality gaming markets.
-        - CRYPTO: Strict check. Must start with 'KX' AND contain a specific coin symbol.
-        - ECON: Broad check. Captures Fed rates, inflation, GDP, and employment data.
-        """
-        t = ticker.upper()
-        s = series_ticker.upper()
-
-        # 1. ESPORTS (The Junk Filter)
+        t = str(ticker or "").upper()
+        s = str(series_ticker or "").upper()
         if "ESPORTS" in t or "ESPORTS" in s:
             return "ESPORTS"
-
-        # 2. CRYPTO (Strict Mode)
-        # Prevents "KXWOSSKATE" (Skateboarding) from being flagged as Crypto.
-        # Must start with KX *AND* contain a known coin symbol.
-        if s.startswith("KX") and any(coin in s for coin in ["BTC", "ETH", "SOL", "DOGE", "SHIB", "BITCOIN"]):
+        if s.startswith("KX") and any(coin in s for coin in ["BTC", "ETH", "SOL", "DOGE", "BITCOIN"]):
             return "CRYPTO"
-
-        # 3. ECONOMICS (Broad Mode)
-        # Captures major macro-economic indicators.
-        if any(k in s for k in ["FED", "INFL", "CPI", "GDP", "RATE", "FOMC", "UNEMPLOYMENT", "CUT", "HIKE"]):
+        if any(k in s for k in ["FED", "INFL", "CPI", "GDP", "RATE", "FOMC", "UNEMPLOYMENT"]):
             return "ECON"
-
         return "MISC"
 
-    async def _process_and_save_batch(self, markets: List[Any]):
-        """
-        Transforms a batch of market data and saves it to the database.
-        """
-        if not markets:
-            return
+    def _parse_retry_after(self, headers: Any) -> Optional[float]:
+        if not headers:
+            return None
+        value = headers.get("Retry-After") or headers.get("retry-after")
+        if not value:
+            return None
+        try:
+            return float(value)
+        except ValueError:
+            try:
+                retry_dt = parsedate_to_datetime(value)
+                if retry_dt:
+                    return max(retry_dt.timestamp() - time.time(), 0.0)
+            except Exception:
+                return None
+        return None
 
-        self.logger.log_info(f"Processing batch of {len(markets)} markets...")
-        loop = asyncio.get_running_loop()
+    def _extract_status_and_retry_after(self, error: Exception) -> Tuple[Optional[int], Optional[float]]:
+        status = getattr(error, "status", None)
+        if status is None:
+            status = getattr(error, "status_code", None)
+        if status is None:
+            status = getattr(error, "code", None)
 
-        # 1. Transform API objects into DB tuples
-        series_data = []
-        market_registry_data = []
-        snapshot_data = []
-        current_timestamp = time.time()
+        headers = getattr(error, "headers", None)
+        response = getattr(error, "response", None)
+        if headers is None and response is not None:
+            headers = getattr(response, "headers", None)
 
-        for market in markets:
-            # --- Data Sanitization Block ---
-            ticker = getattr(market, 'ticker', None)
-            if not ticker:
-                continue  # Skip invalid markets
+        retry_after = self._parse_retry_after(headers)
+        return status, retry_after
 
-            # Handle series_ticker being None or missing
-            raw_series = getattr(market, 'series_ticker', None)
-            if raw_series:
-                series_ticker = raw_series
-            else:
-                # Fallback: extract from ticker (e.g., "KXETH-24DEC" -> "KXETH")
-                series_ticker = ticker.split('-')[0]
-            # -------------------------------
+    def _compute_429_cooldown(self, retry_after: Optional[float]) -> float:
+        now = time.time()
+        if now - self._last_harvest_429_ts > 60:
+            self._harvest_429_count = 0
+        self._harvest_429_count = min(self._harvest_429_count + 1, 5)
+        self._last_harvest_429_ts = now
 
-            category = self._categorize(ticker, series_ticker)
+        backoff = 2.0 * (2 ** (self._harvest_429_count - 1))
+        backoff = min(backoff, 30.0)
+        if retry_after is not None:
+            backoff = max(backoff, retry_after)
+        backoff += random.uniform(0.0, 0.5)
+        return backoff
 
-            # OPTIMIZATION: Do not save ESPORTS to the DB to save space/IO
-            if category == 'ESPORTS':
-                continue
+    def _set_global_cooldown(self, seconds: float) -> None:
+        now = time.time()
+        target = now + max(0.0, seconds)
+        current = self.db.get_rate_limit_cooldown_until()
+        if target > current:
+            self.db.set_rate_limit_cooldown_until(target)
 
-            # Prepare Snapshot Data (ticker, time, bid, ask, spread, vol, oi, status)
-            yes_bid = getattr(market, 'yes_bid', 0)
-            yes_ask = getattr(market, 'yes_ask', 0)
+    async def _maybe_wait_for_global_cooldown(self) -> bool:
+        now = time.time()
+        cooldown_until = self.db.get_rate_limit_cooldown_until()
+        if now < cooldown_until:
+            if now - self._last_global_cooldown_log_ts >= 10.0:
+                self._last_global_cooldown_log_ts = now
+                self.logger.log_warn(
+                    f"[Harvester] Global cooldown active for {cooldown_until - now:.2f}s. Pausing discovery.")
+            await asyncio.sleep(min(1.0, cooldown_until - now))
+            return True
+        return False
 
-            # Calculate spread safely
-            if yes_bid and yes_ask:
-                spread = yes_ask - yes_bid
-            else:
-                spread = 99
-
-            # Discovery Log - log any market with a tight spread, regardless of category
-            if spread <= 5:
+    async def _discovery_loop(self):
+        """The main execution cycle for the broad market scan."""
+        self.logger.log_info("[Harvester] Starting Discovery Loop (60s)...")
+        while True:
+            try:
                 self.logger.log_info(
-                    f"Harvester: Found high-liquidity '{category}' market: {ticker} (Spread: {spread})")
+                    "[Harvester] Discovery: Starting full market scan.")
+                await self._harvest_all_markets_paginated()
+            except Exception as e:
+                self.logger.log_error(f"[Harvester] Discovery Loop Error: {e}")
 
-            snapshot_data.append((
-                ticker,
-                current_timestamp,
-                yes_bid,
-                yes_ask,
-                spread,
-                getattr(market, 'volume', 0),
-                getattr(market, 'open_interest', 0),
-                'active'
-            ))
+            await asyncio.sleep(60)
 
-        # 2. Perform bulk DB writes in a background thread executor
-        # We align these calls with the DatabaseManager methods defined in services/db.py
-        db_ops_start_time = time.time()
-
-        # Write Metadata (Series + Registry)
-        await loop.run_in_executor(None, self.db.upsert_metadata, series_data, market_registry_data)
-
-        # Write Snapshots
-        await loop.run_in_executor(None, self.db.bulk_upsert_markets, snapshot_data)
-
-        db_ops_duration = time.time() - db_ops_start_time
-        self.logger.log_info(
-            f"Database write for batch completed in {db_ops_duration:.2f}s.")
-
-    async def _harvest_all_markets(self):
-        """
-        Fetches all open markets via pagination, transforms them, and writes
-        them to the database in non-blocking, bulk operations.
-        """
-        self.logger.log_info("Starting full market harvest cycle...")
-        start_time = time.time()
-        loop = asyncio.get_running_loop()
-
-        # 1. Fetch markets page by page and process in batches
-        current_batch = []
+    async def _harvest_all_markets_paginated(self):
+        """Paginates through all open markets, saving metrics to market_metrics."""
         cursor = None
-        pages_fetched = 0
+        loop = asyncio.get_running_loop()
+        page_count = 0
+        total_found = 0
+        seen_cursors = set()
+        seen_tickers_this_cycle = set()
 
         while True:
-            pages_fetched += 1
-            self.logger.log_info(
-                f"Harvester: Fetching page {pages_fetched}...")
+            if await self._maybe_wait_for_global_cooldown():
+                continue
+            try:
+                response = await loop.run_in_executor(
+                    None, lambda: self.market_api.get_markets(
+                        limit=100, status="open", cursor=cursor)
+                )
 
-            # Run the blocking API call in an executor
-            response = await loop.run_in_executor(
-                None,
-                lambda: self.market_api.get_markets(
-                    limit=100, status="open", cursor=cursor)
-            )
+                markets = getattr(response, 'markets', [])
+                if not markets:
+                    break
 
-            if not hasattr(response, 'markets') or not response.markets:
-                self.logger.log_info("Harvester: No more markets returned.")
+                first_ticker = getattr(markets[0], 'ticker', None)
+                if first_ticker and first_ticker in seen_tickers_this_cycle:
+                    self.logger.log_warn(
+                        f"[Harvester] Loop detected. Cycle complete at {total_found} markets.")
+                    break
+
+                for m in markets:
+                    t = getattr(m, 'ticker', None)
+                    if t:
+                        seen_tickers_this_cycle.add(t)
+
+                await self._save_metrics_batch(markets)
+
+                total_found += len(markets)
+                page_count += 1
+
+                if page_count % 20 == 0:
+                    self.logger.log_info(
+                        f"[Harvester] Discovery: Scanned {total_found} markets across {page_count} pages.")
+
+                next_cursor = getattr(response, 'cursor', None)
+                if not next_cursor or next_cursor in seen_cursors:
+                    break
+                seen_cursors.add(next_cursor)
+                cursor = next_cursor
+
+                await asyncio.sleep(random.uniform(0.05, 0.15))
+
+            except Exception as e:
+                status, retry_after = self._extract_status_and_retry_after(e)
+                if status == 429:
+                    cooldown = self._compute_429_cooldown(retry_after)
+                    self._set_global_cooldown(cooldown)
+                    self.logger.log_warn(
+                        f"[Harvester] Discovery HTTP 429. Backing off for {cooldown:.2f}s.")
+                    continue
+
+                self.logger.log_error(f"[Harvester] Pagination break: {e}")
                 break
 
-            current_batch.extend(response.markets)
+    async def _save_metrics_batch(self, markets: List[Any]):
+        """Parses markets and saves to market_metrics + metadata."""
+        metrics_data, series_data, market_reg_data = [], [], []
+        now = time.time()
 
-            # Batched Ingestion: Write to DB every 500 markets
-            if len(current_batch) >= 500:
-                await self._process_and_save_batch(current_batch)
-                self.logger.log_info(
-                    f"Harvester: Flushed batch of {len(current_batch)} markets to DB.")
-                current_batch = []  # Clear the batch
+        for m in markets:
+            ticker = getattr(m, 'ticker', None)
+            if not ticker:
+                continue
 
-            cursor = getattr(response, 'cursor', None)
-            if cursor is None:
-                self.logger.log_info("Harvester: End of market data reached.")
-                break
+            s_ticker = getattr(m, 'series_ticker',
+                               None) or ticker.split('-')[0]
+            cat = self._categorize(ticker, s_ticker)
+            if cat == 'ESPORTS':
+                continue
 
-        # Process any remaining markets in the last batch
-        if current_batch:
-            self.logger.log_info(
-                f"Processing final batch of {len(current_batch)} markets.")
-            await self._process_and_save_batch(current_batch)
+            series_data.append((s_ticker, s_ticker, cat, 'unknown'))
+            market_reg_data.append(
+                (ticker, s_ticker, getattr(m, 'expiration_time', '')))
 
-        total_duration = time.time() - start_time
-        self.logger.log_info(
-            f"Harvest cycle finished. Total time: {total_duration:.2f}s.")
+            volume = getattr(m, 'volume', 0)
+            open_interest = getattr(m, 'open_interest', 0)
+            bid = getattr(m, 'yes_bid', 0)
+            raw_ask = getattr(m, 'yes_ask', 100)
+            ask = 100 if (raw_ask == 0 or raw_ask is None) else raw_ask
+            spread = ask - bid
+
+            metrics_data.append((ticker, now, volume, open_interest, spread, bid, ask, 'active'))
+
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self.db.upsert_metadata, series_data, market_reg_data)
+        if metrics_data:
+            await loop.run_in_executor(None, self.db.bulk_upsert_metrics, metrics_data)
 
     async def run_harvest_loop(self):
         """
-        Runs the main infinite loop for the harvester service, with error handling.
+        Entry point for the harvester service.
+        Runs only the Discovery Loop.
         """
-        self.logger.log_info("MarketHarvester service starting main loop.")
-        while True:
-            try:
-                await self._harvest_all_markets()
-            except Exception as e:
-                self.logger.log_error(f"Harvester crash: {e}")
-
-            self.logger.log_info("Cycle complete. Sleeping for 60 seconds...")
-            await asyncio.sleep(60)
+        await self._discovery_loop()

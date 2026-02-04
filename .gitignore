@@ -1,0 +1,10 @@
+# Ignore all database files
+*.db
+*.sqlite
+
+# Ignore all Parquet data files
+*.parquet
+data/training/
+data/recordings/
+
+.env
