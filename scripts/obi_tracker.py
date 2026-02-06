@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import random
 import time
 import urllib.error
@@ -12,7 +13,7 @@ from kalshi_python import ApiClient, Configuration
 from kalshi_python.api import markets_api
 
 from config import AppConfig
-from services.db import DatabaseManager
+from services.db import DatabaseManager, DB_PATH, OBI_DB_PATH
 from services.kalshi_signing import build_auth_headers
 from utils.logger import logger
 
@@ -27,7 +28,9 @@ class ObiTracker:
 
     def __init__(self):
         self.config = AppConfig()
-        self.db = DatabaseManager()
+        self.db_primary = DatabaseManager(db_path=DB_PATH, schema="primary")
+        self.db_obi = DatabaseManager(db_path=OBI_DB_PATH, schema="obi")
+        self._obi_db_split = OBI_DB_PATH != DB_PATH
 
         self.api_client: Optional[ApiClient] = None
         self.market_api: Optional[markets_api.MarketsApi] = None
@@ -117,7 +120,7 @@ class ObiTracker:
             LIMIT ?
         """
 
-        with self.db.get_connection() as conn:
+        with self.db_primary.get_connection(role="read") as conn:
             rows = conn.execute(query, (cutoff_time, limit)).fetchall()
 
         tickers: List[str] = []
@@ -393,10 +396,10 @@ class ObiTracker:
         global_cooldown = max(2.0, global_cooldown)
         global_cooldown *= random.uniform(0.8, 1.2)
         try:
-            current = self.db.get_rate_limit_cooldown_until()
+            current = self.db_primary.get_rate_limit_cooldown_until()
             target = now + global_cooldown
             if target > current:
-                self.db.set_rate_limit_cooldown_until(target)
+                self.db_primary.set_rate_limit_cooldown_until(target)
         except Exception as e:
             self._log_throttled(
                 f"[ObiTracker] Failed to write global cooldown: {e}",
@@ -458,7 +461,7 @@ class ObiTracker:
 
             while True:
                 now = time.time()
-                cooldown_until = max(self._global_cooldown_until, self.db.get_rate_limit_cooldown_until())
+                cooldown_until = max(self._global_cooldown_until, self.db_primary.get_rate_limit_cooldown_until())
                 if now < cooldown_until:
                     if now - self._last_global_cooldown_log_ts >= 10.0:
                         self._last_global_cooldown_log_ts = now
@@ -536,7 +539,7 @@ class ObiTracker:
                 (t, ts, obi["bid_count"], obi["ask_count"], obi["best_bid"], obi["best_ask"]))
 
         if obi_rows:
-            self.db.bulk_upsert_obi(obi_rows)
+            self.db_obi.bulk_upsert_obi(obi_rows)
 
         return len(obi_rows), fetched, empty, rate_limited, errors
 
@@ -606,6 +609,10 @@ class ObiTracker:
             await asyncio.sleep(max(0.0, 1.0 - elapsed))
 
     async def run(self):
+        logger.log_info(
+            f"[ObiTracker] Startup: pid={os.getpid()}, cwd={os.getcwd()}, "
+            f"db_primary={DB_PATH} db_obi={OBI_DB_PATH}"
+        )
         if not self._connect_api():
             return
 

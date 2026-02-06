@@ -1,6 +1,6 @@
 import pandas as pd
 import time
-from services.db import DatabaseManager
+from services.db import DatabaseManager, TRAINING_DIR
 
 db = DatabaseManager()
 
@@ -29,7 +29,7 @@ with db.get_connection() as conn:
 # 4. Parquet Check(If you have recorders running)
 print("\n--- CHECKING PARQUET FILES ---")
 try:
-    df_parquet = pd.read_parquet("data/training/")  # Adjust path
+    df_parquet = pd.read_parquet(TRAINING_DIR)  # Adjust path
     print(df_parquet.head())
 except Exception as e:
     print(f"No parquet files generated yet: {e}")

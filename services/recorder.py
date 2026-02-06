@@ -5,8 +5,10 @@ import pyarrow.parquet as pq
 import os
 import time
 from datetime import datetime
-from typing import List, Dict
+from pathlib import Path
+from typing import List, Dict, Optional
 from collections import defaultdict
+from services.db import ensure_training_dir, REPO_ROOT
 
 
 class AsyncMarketRecorder:
@@ -15,20 +17,29 @@ class AsyncMarketRecorder:
     Optimized for M4 performance with a 30-second flush interval and stateful time indexing.
     """
 
-    def __init__(self, save_path="data/training", flush_interval=30):
+    def __init__(self, save_path: Optional[str] = None, flush_interval=30):
         """
         Initializes the recorder.
         Args:
             save_path (str): The root directory for the partitioned Parquet dataset.
             flush_interval (int): The interval in seconds to flush the buffer to disk.
         """
-        self.save_path = save_path
+        if save_path is None:
+            save_root = ensure_training_dir()
+        else:
+            save_root = Path(os.path.expanduser(save_path))
+            if not save_root.is_absolute():
+                # Interpret relative paths as repo-root-relative for portability.
+                save_root = Path(REPO_ROOT) / save_root
+            save_root = save_root.resolve(strict=False)
+            save_root.mkdir(parents=True, exist_ok=True)
+
+        self.save_path = str(save_root)
         self.flush_interval = flush_interval
         self.buffer: List[Dict] = []
         self.last_flush_time = time.time()
         # For stateful time_idx per ticker
         self.time_indexes = defaultdict(int)
-        os.makedirs(self.save_path, exist_ok=True)
 
     async def record(self, enriched_data: dict, category: str, series_ticker: str, status: str):
         """

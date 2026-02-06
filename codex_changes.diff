@@ -1,0 +1,2712 @@
+diff --git a/main.py b/main.py
+old mode 100644
+new mode 100755
+index baadcd2..18156cc
+--- a/main.py
++++ b/main.py
+@@ -1,10 +1,20 @@
+ import asyncio
++import faulthandler
++import os
++import signal
++import sqlite3
++import threading
+ import time
+-from typing import List, Optional
++import traceback
++from concurrent.futures import ThreadPoolExecutor
++from contextlib import suppress
++from typing import List, Optional, Tuple
+ 
+ from pydantic import ValidationError
+ 
+ from utils.logger import logger
++
++faulthandler.enable()
+ try:
+     from config import AppConfig
+     from services.feed import MarketFeed
+@@ -14,52 +24,596 @@ try:
+     from services.harvester import MarketHarvester
+     from services.recorder import AsyncMarketRecorder
+     from services.features import FeatureExtractor
++    from services.db import DatabaseManager, DB_PATH
+ except ImportError as e:
+-    logger.log_error(
+-        f"FATAL: A required project file could not be imported: {e}")
+-    exit(1)
++    logger.log_error(f"FATAL: A required project file could not be imported: {e}")
++    raise
+ 
+ 
+ async def amain():
+     """The main asynchronous entry point for the application."""
+     logger.log_info("--- Starting Project K-Alpha (Phase 4: AI-Data) ---")
++    logger.log_info(
++        f"[Main] Startup: pid={os.getpid()}, cwd={os.getcwd()}, db={DB_PATH}"
++    )
++
++    shutdown_event = asyncio.Event()
++    exit_reason = "normal"
++
++    loop = asyncio.get_running_loop()
++
++    def _asyncio_exception_handler(_loop, context):
++        msg = context.get("message", "Asyncio exception")
++        exc = context.get("exception")
++        if exc is not None:
++            tb = "".join(
++                traceback.format_exception(type(exc), exc, exc.__traceback__)
++            )
++            logger.log_error(f"[Main] Asyncio exception: {msg}\n{tb}")
++        else:
++            logger.log_error(f"[Main] Asyncio exception: {msg}")
++
++    loop.set_exception_handler(_asyncio_exception_handler)
++
++    def _signal_handler(signum: int):
++        nonlocal exit_reason
++        exit_reason = f"signal {signum}"
++        logger.log_warn(f"[Main] Signal received: {signum}. Initiating shutdown.")
++        shutdown_event.set()
++
++    def _dump_stacks_handler(signum: int):
++        logger.log_warn(
++            f"[Main] Signal received: {signum}. Dumping stack traces (all threads)."
++        )
++        faulthandler.dump_traceback(all_threads=True)
++
++    try:
++        for sig in (signal.SIGTERM, signal.SIGINT):
++            try:
++                loop.add_signal_handler(sig, _signal_handler, sig)
++            except NotImplementedError:
++                signal.signal(sig, lambda s, f: _signal_handler(s))
++
++        # On-demand stack dump for diagnosing "hung but alive" states.
++        if hasattr(signal, "SIGUSR1"):
++            try:
++                loop.add_signal_handler(
++                    signal.SIGUSR1, _dump_stacks_handler, signal.SIGUSR1
++                )
++            except NotImplementedError:
++                signal.signal(signal.SIGUSR1, lambda s, f: _dump_stacks_handler(s))
++    except Exception as e:
++        logger.log_warn(f"[Main] Signal handler setup failed: {e}")
++
+     recorder: Optional[AsyncMarketRecorder] = None
++    heartbeat_task: Optional[asyncio.Task] = None
++    feed_connect_lock = asyncio.Lock()
++    api_executor: Optional[ThreadPoolExecutor] = None
++    db_write_executor: Optional[ThreadPoolExecutor] = None
++    db_read_executor: Optional[ThreadPoolExecutor] = None
++    db_health_executor: Optional[ThreadPoolExecutor] = None
++
++    # Harvester supervision
++    harvester_generation: int = 0
++    current_harvester_task: Optional[asyncio.Task] = None
++    current_harvester: Optional[MarketHarvester] = None
++    harvester_tasks: List[asyncio.Task] = []
++    harvester_restart_lock = asyncio.Lock()
++    restart_after_ts: float = 0.0
++    restart_reason: str = ""
++
++    # Heartbeat / watchdog tuning
++    HEARTBEAT_INTERVAL_S: float = 30.0
++    METRICS_STALE_THRESHOLD_S: float = 180.0
++    METRICS_STALE_CONSECUTIVE_HEARTBEATS: int = 2
++    FORCE_EXIT_STALE_S: float = 600.0
++    TIMEOUT_WINDOW_THRESHOLD: int = 10  # timeouts per ~120s window
++    CIRCUIT_BREAKER_COOLDOWN_S: float = 60.0
++    DB_HEALTH_TIMEOUT_S: float = 5.0
++    DB_HEALTH_CONSECUTIVE_FAILURES_THRESHOLD: int = 3
++    DB_HEALTH_FORCE_EXIT_UNHEALTHY_S: float = 600.0
++    DB_CIRCUIT_BREAKER_COOLDOWN_S: float = 60.0
++
+     try:
+         config = AppConfig()
++        db = DatabaseManager()
++
++        # Isolate API calls and DB work in separate executors.
++        API_EXECUTOR_WORKERS: int = 6
++        try:
++            DB_READ_EXECUTOR_WORKERS: int = int(
++                os.getenv("PROJECT_K_DB_READ_WORKERS") or "4"
++            )
++        except ValueError:
++            logger.log_warn(
++                f"[Main] Invalid PROJECT_K_DB_READ_WORKERS={os.getenv('PROJECT_K_DB_READ_WORKERS')!r}; defaulting to 4."
++            )
++            DB_READ_EXECUTOR_WORKERS = 4
++        api_executor: ThreadPoolExecutor = ThreadPoolExecutor(
++            max_workers=API_EXECUTOR_WORKERS, thread_name_prefix="pk_api"
++        )
++        db_write_executor = ThreadPoolExecutor(
++            max_workers=1, thread_name_prefix="pk_dbw"
++        )
++        db_read_executor = ThreadPoolExecutor(
++            max_workers=max(1, DB_READ_EXECUTOR_WORKERS), thread_name_prefix="pk_dbr"
++        )
++        db_health_executor = ThreadPoolExecutor(
++            max_workers=1, thread_name_prefix="pk_dbh"
++        )
++
++        class _InflightCounters:
++            inflight_reads: int = 0
++            inflight_writes: int = 0
++
++        inflight = _InflightCounters()
+ 
+         # Initialize services
+-        feed = MarketFeed(config, logger)
++        feed = MarketFeed(
++            config,
++            logger,
++            api_executor=api_executor,
++            db_read_executor=db_read_executor,
++            inflight_counters=inflight,
++        )
+         strategy = MomentumStrategy()
+         tracker = PortfolioTracker()
+-        recorder = AsyncMarketRecorder()  # Upgraded recorder
+-        feature_extractor = FeatureExtractor()  # New feature extractor
++        recorder = AsyncMarketRecorder()
++        feature_extractor = FeatureExtractor()
+         executor: Optional[OrderExecutor] = None
+ 
+         tickers: List[str] = []
+         last_ticker_refresh_time: float = 0.0
+-        TICKER_REFRESH_INTERVAL: int = 60  # 1 minute
+-        ORDERBOOK_POLL_INTERVAL: int = 2      # 2 seconds
++        TICKER_REFRESH_INTERVAL: float = 60.0
++        ORDERBOOK_POLL_INTERVAL: float = 2.0
++
++        def _is_current(gen: int) -> bool:
++            return (not shutdown_event.is_set()) and gen == harvester_generation
++
++        def _harvester_state(task: Optional[asyncio.Task]) -> str:
++            if task is None:
++                return "none"
++            if task.cancelled():
++                return "cancelled"
++            if task.done():
++                return "done"
++            return "running"
++
++        def _get_metrics_max_info_sync() -> Tuple[float, str]:
++            return db.get_market_metrics_max_info(role="health")
++
++        async def _get_metrics_max_info() -> Tuple[float, str]:
++            fut = loop.run_in_executor(db_health_executor, _get_metrics_max_info_sync)
++            return await asyncio.wait_for(fut, timeout=DB_HEALTH_TIMEOUT_S)
++
++        def _thread_counts() -> Tuple[int, int, int, int, int]:
++            threads = threading.enumerate()
++            total = len(threads)
++            api_threads = sum(1 for t in threads if t.name.startswith("pk_api"))
++            dbr_threads = sum(1 for t in threads if t.name.startswith("pk_dbr"))
++            dbw_threads = sum(1 for t in threads if t.name.startswith("pk_dbw"))
++            dbh_threads = sum(1 for t in threads if t.name.startswith("pk_dbh"))
++            return total, api_threads, dbr_threads, dbw_threads, dbh_threads
++
++        async def _start_or_restart_harvester(reason: str) -> None:
++            nonlocal harvester_generation, current_harvester_task, current_harvester
++
++            async with harvester_restart_lock:
++                if shutdown_event.is_set():
++                    return
++
++                if not feed.is_connected or not feed.api_client:
++                    logger.log_warn(
++                        f"[Main] Harvester start requested but feed not connected (reason={reason})."
++                    )
++                    return
++
++                old_task = current_harvester_task
++
++                harvester_generation += 1
++                gen = harvester_generation
++                logger.log_warn(
++                    f"[Main] Starting MarketHarvester gen={gen} (reason={reason})."
++                )
++
++                harvester = MarketHarvester(
++                    feed.api_client,
++                    logger,
++                    generation=gen,
++                    is_current=_is_current,
++                    api_executor=api_executor,
++                    db_write_executor=db_write_executor,
++                    db_read_executor=db_read_executor,
++                    inflight_counters=inflight,
++                )
++                current_harvester = harvester
++                new_task = asyncio.create_task(harvester.run_harvest_loop())
++                new_task.add_done_callback(
++                    lambda t, g=gen: _on_harvester_done(t, g)
++                )
++
++                harvester_tasks.append(new_task)
++                current_harvester_task = new_task
++
++                if old_task and not old_task.done():
++                    old_task.cancel()
++                    try:
++                        await asyncio.wait_for(old_task, timeout=5.0)
++                    except asyncio.TimeoutError:
++                        logger.log_error(
++                            f"[Main] Previous MarketHarvester did not cancel within 5s (old_gen<{gen})."
++                        )
++                    except asyncio.CancelledError:
++                        pass
++                    except Exception as e:
++                        logger.log_error(
++                            f"[Main] Error awaiting previous MarketHarvester cancellation: {e}"
++                        )
++
++        def _on_harvester_done(task: asyncio.Task, gen: int) -> None:
++            nonlocal restart_after_ts, restart_reason, current_harvester
++
++            if shutdown_event.is_set():
++                return
++
++            # If this isn't the active generation, it's expected to stop.
++            if gen != harvester_generation:
++                logger.log_info(
++                    f"[Main] MarketHarvester gen={gen} ended (stale)."
++                )
++                return
++            current_harvester = None
++
++            if task.cancelled():
++                logger.log_warn(
++                    f"[Main] MarketHarvester gen={gen} cancelled."
++                )
++            else:
++                exc = task.exception()
++                if exc:
++                    tb = "".join(
++                        traceback.format_exception(type(exc), exc, exc.__traceback__)
++                    )
++                    logger.log_error(
++                        f"[Main] MarketHarvester gen={gen} crashed: {exc}\n{tb}"
++                    )
++                else:
++                    logger.log_warn(
++                        f"[Main] MarketHarvester gen={gen} ended unexpectedly."
++                    )
++
++            # Schedule a restart shortly (heartbeat loop will execute it).
++            if restart_after_ts <= 0.0:
++                restart_after_ts = time.time() + 5.0
++                restart_reason = "harvester ended"
++
++        circuit_breaker_last_ts: float = 0.0
++        circuit_breaker_reinit_count: int = 0
++        stale_heartbeat_hits: int = 0
++        stale_start_ts: float = 0.0
++        db_circuit_breaker_last_ts: float = 0.0
++        db_circuit_breaker_reinit_count: int = 0
++        db_health_consecutive_failures: int = 0
++        last_successful_metrics_read_mono: float = time.monotonic()
++        last_db_health_failure_repr: str = ""
++        last_db_health_failure_kind: str = ""
++
++        async def _reinit_client_and_executors(reason: str) -> None:
++            nonlocal api_executor, executor, circuit_breaker_last_ts, circuit_breaker_reinit_count
++
++            now = time.time()
++            if now - circuit_breaker_last_ts < CIRCUIT_BREAKER_COOLDOWN_S:
++                logger.log_warn(
++                    f"[CircuitBreaker] Suppressing reinit (reason={reason}) due to cooldown "
++                    f"({now - circuit_breaker_last_ts:.1f}s since last)."
++                )
++                return
++
++            circuit_breaker_last_ts = now
++            circuit_breaker_reinit_count += 1
++
++            logger.log_error(
++                f"[CircuitBreaker] Triggered (reason={reason}). Reinitializing Kalshi client + API executor "
++                f"(attempt={circuit_breaker_reinit_count})."
++            )
++
++            # Cancel active harvester first (it may be stuck in an executor thread).
++            if current_harvester_task and not current_harvester_task.done():
++                current_harvester_task.cancel()
++                with suppress(asyncio.CancelledError):
++                    try:
++                        await asyncio.wait_for(current_harvester_task, timeout=5.0)
++                    except asyncio.TimeoutError:
++                        logger.log_error(
++                            "[CircuitBreaker] Harvester did not cancel within 5s; continuing with reinit."
++                        )
++
++            # Replace the API executor to avoid starvation from stuck threads.
++            old_api_executor = api_executor
++            api_executor = ThreadPoolExecutor(
++                max_workers=API_EXECUTOR_WORKERS, thread_name_prefix="pk_api"
++            )
++            try:
++                old_api_executor.shutdown(wait=False, cancel_futures=True)
++            except Exception as e:
++                logger.log_warn(f"[CircuitBreaker] Failed to shutdown old API executor: {e}")
++
++            feed.set_executors(api_executor=api_executor)
++
++            # Reconnect the SDK client.
++            async with feed_connect_lock:
++                feed.is_connected = False
++                ok = await feed.connect()
++                if not ok or not feed.api_client:
++                    logger.log_error("[CircuitBreaker] Feed reconnect failed; will retry in main loop.")
++                    return
++
++                executor = OrderExecutor(feed.api_client, logger, tracker)
++
++            await _start_or_restart_harvester(f"circuit breaker: {reason}")
++
++        async def _reinit_db_write_executor_and_connections(reason: str) -> None:
++            nonlocal db_write_executor, db_health_executor, db_circuit_breaker_last_ts, db_circuit_breaker_reinit_count
++
++            now = time.time()
++            if now - db_circuit_breaker_last_ts < DB_CIRCUIT_BREAKER_COOLDOWN_S:
++                logger.log_warn(
++                    f"[DBCircuitBreaker] Suppressing reinit (reason={reason}) due to cooldown "
++                    f"({now - db_circuit_breaker_last_ts:.1f}s since last)."
++                )
++                return
++
++            db_circuit_breaker_last_ts = now
++            db_circuit_breaker_reinit_count += 1
++
++            logger.log_error(
++                f"[DBCircuitBreaker] Triggered (reason={reason}). Reinitializing DB write executor + connection cache "
++                f"(attempt={db_circuit_breaker_reinit_count})."
++            )
++
++            if current_harvester_task and not current_harvester_task.done():
++                current_harvester_task.cancel()
++                with suppress(asyncio.CancelledError):
++                    try:
++                        await asyncio.wait_for(current_harvester_task, timeout=5.0)
++                    except asyncio.TimeoutError:
++                        logger.log_error(
++                            "[DBCircuitBreaker] Harvester did not cancel within 5s; continuing with DB reinit."
++                        )
++
++            old_db_write_executor = db_write_executor
++            db_write_executor = ThreadPoolExecutor(
++                max_workers=1, thread_name_prefix="pk_dbw"
++            )
++            if old_db_write_executor:
++                try:
++                    old_db_write_executor.shutdown(wait=False, cancel_futures=True)
++                except Exception as e:
++                    logger.log_warn(
++                        f"[DBCircuitBreaker] Failed to shutdown old DB write executor: {e}"
++                    )
++
++            old_db_health_executor = db_health_executor
++            db_health_executor = ThreadPoolExecutor(
++                max_workers=1, thread_name_prefix="pk_dbh"
++            )
++            if old_db_health_executor:
++                try:
++                    old_db_health_executor.shutdown(wait=False, cancel_futures=True)
++                except Exception as e:
++                    logger.log_warn(
++                        f"[DBCircuitBreaker] Failed to shutdown old DB health executor: {e}"
++                    )
++
++            try:
++                DatabaseManager.reset_connection_cache()
++            except Exception as e:
++                logger.log_warn(
++                    f"[DBCircuitBreaker] Failed to reset DB connection cache: {e}"
++                )
++
++            await _start_or_restart_harvester(f"db circuit breaker: {reason}")
++
++        async def _heartbeat_loop() -> None:
++            nonlocal restart_after_ts, restart_reason, stale_heartbeat_hits, stale_start_ts
++            nonlocal db_health_consecutive_failures, last_successful_metrics_read_mono, last_db_health_failure_repr, last_db_health_failure_kind
++
++            while not shutdown_event.is_set():
++                now = time.time()
++
++                max_ts = 0.0
++                max_local = "n/a"
++                metrics_read_start_mono = time.monotonic()
++                try:
++                    max_ts, max_local = await _get_metrics_max_info()
++                    db_health_consecutive_failures = 0
++                    last_successful_metrics_read_mono = time.monotonic()
++                    last_db_health_failure_repr = ""
++                    last_db_health_failure_kind = ""
++                except asyncio.TimeoutError as e:
++                    elapsed_s = time.monotonic() - metrics_read_start_mono
++                    db_health_consecutive_failures += 1
++                    last_db_health_failure_kind = "timeout"
++                    last_db_health_failure_repr = repr(e)
++                    logger.log_warn(
++                        f"[Heartbeat] DB health check timed out after {elapsed_s:.2f}s: {repr(e)}"
++                    )
++                except sqlite3.OperationalError as e:
++                    elapsed_s = time.monotonic() - metrics_read_start_mono
++                    db_health_consecutive_failures += 1
++                    last_db_health_failure_kind = "sqlite3.OperationalError"
++                    last_db_health_failure_repr = repr(e)
++                    logger.log_warn(
++                        f"[Heartbeat] DB health check failed after {elapsed_s:.2f}s (locked/busy): {repr(e)}"
++                    )
++                except Exception as e:
++                    elapsed_s = time.monotonic() - metrics_read_start_mono
++                    db_health_consecutive_failures += 1
++                    last_db_health_failure_kind = type(e).__name__
++                    last_db_health_failure_repr = repr(e)
++                    logger.log_warn(
++                        f"[Heartbeat] DB health check failed after {elapsed_s:.2f}s: {repr(e)}"
++                    )
++
++                stale_s: Optional[float] = None
++                if max_ts:
++                    stale_s = max(0.0, now - max_ts)
++
++                # Track consecutive stale heartbeats for circuit breaking.
++                if stale_s is not None and stale_s > METRICS_STALE_THRESHOLD_S:
++                    stale_heartbeat_hits += 1
++                    if stale_start_ts <= 0.0:
++                        stale_start_ts = now
++                else:
++                    stale_heartbeat_hits = 0
++                    stale_start_ts = 0.0
++
++                h_state = _harvester_state(current_harvester_task)
++                stale_str = f"{stale_s:.0f}" if stale_s is not None else "n/a"
++                db_health_age_s = time.monotonic() - last_successful_metrics_read_mono
++                db_health_last = last_db_health_failure_kind or "ok"
++
++                timeouts_120s = 0
++                consecutive_timeouts = 0
++                if current_harvester and current_harvester.generation == harvester_generation:
++                    try:
++                        timeouts_120s, consecutive_timeouts = current_harvester.get_timeout_stats()
++                    except Exception:
++                        timeouts_120s, consecutive_timeouts = 0, 0
++
++                total_threads, api_threads, dbr_threads, dbw_threads, dbh_threads = _thread_counts()
++
++                logger.log_info(
++                    f"[Heartbeat] pid={os.getpid()} db={DB_PATH} "
++                    f"max_ts={max_ts:.0f} ({max_local}) stale_s={stale_str} "
++                    f"api_timeouts_120s={timeouts_120s} consecutive_timeouts={consecutive_timeouts} "
++                    f"db_health_age_s={db_health_age_s:.0f} db_health_failures={db_health_consecutive_failures} db_health_last={db_health_last} "
++                    f"inflight_reads={inflight.inflight_reads} inflight_writes={inflight.inflight_writes} "
++                    f"threads={total_threads} api_threads={api_threads} "
++                    f"dbr_threads={dbr_threads} dbw_threads={dbw_threads} dbh_threads={dbh_threads} "
++                    f"active_tickers={len(tickers)} harvester_state={h_state} harvester_gen={harvester_generation}"
++                )
++
++                if db_health_consecutive_failures >= DB_HEALTH_CONSECUTIVE_FAILURES_THRESHOLD:
++                    await _reinit_db_write_executor_and_connections(
++                        f"{db_health_consecutive_failures} consecutive DB health failures "
++                        f"({last_db_health_failure_kind}: {last_db_health_failure_repr})"
++                    )
++                    db_health_consecutive_failures = 0
++                    last_db_health_failure_kind = ""
++                    last_db_health_failure_repr = ""
++
++                if (
++                    db_circuit_breaker_reinit_count > 0
++                    and db_health_age_s > DB_HEALTH_FORCE_EXIT_UNHEALTHY_S
++                ):
++                    logger.log_error(
++                        f"[Watchdog] DB health check has not succeeded for >{DB_HEALTH_FORCE_EXIT_UNHEALTHY_S:.0f}s "
++                        f"after DB reinit attempts (attempts={db_circuit_breaker_reinit_count}). "
++                        "Forcing hard exit for external supervisor restart."
++                    )
++                    os._exit(2)
++
++                # Restart if the active harvester task is missing/done.
++                if feed.is_connected and (
++                    current_harvester_task is None or current_harvester_task.done()
++                ):
++                    if restart_after_ts <= 0.0:
++                        restart_after_ts = now + 1.0
++                        restart_reason = "harvester missing/done"
++
++                # Circuit breaker: too many API timeouts OR stale metrics for N consecutive heartbeats.
++                if feed.is_connected and timeouts_120s >= TIMEOUT_WINDOW_THRESHOLD:
++                    await _reinit_client_and_executors(
++                        f"api timeouts >= {TIMEOUT_WINDOW_THRESHOLD} in 120s"
++                    )
++                    restart_after_ts = 0.0
++                    restart_reason = ""
++                elif (
++                    feed.is_connected
++                    and stale_heartbeat_hits >= METRICS_STALE_CONSECUTIVE_HEARTBEATS
++                ):
++                    await _reinit_client_and_executors(
++                        f"market_metrics stale for {stale_heartbeat_hits} heartbeats"
++                    )
++                    restart_after_ts = 0.0
++                    restart_reason = ""
++
++                # Hard fail if staleness persists for too long even after reinit attempts.
++                if (
++                    feed.is_connected
++                    and stale_start_ts > 0.0
++                    and stale_s is not None
++                    and stale_s > METRICS_STALE_THRESHOLD_S
++                    and circuit_breaker_reinit_count > 0
++                    and (now - stale_start_ts) > FORCE_EXIT_STALE_S
++                ):
++                    logger.log_error(
++                        f"[Watchdog] market_metrics stale for >{FORCE_EXIT_STALE_S:.0f}s after reinit attempts. "
++                        "Forcing hard exit for external supervisor restart."
++                    )
++                    os._exit(2)
++
++                # Execute any scheduled restart.
++                if restart_after_ts and now >= restart_after_ts:
++                    await _start_or_restart_harvester(restart_reason or "scheduled")
++                    restart_after_ts = 0.0
++                    restart_reason = ""
++
++                await asyncio.sleep(HEARTBEAT_INTERVAL_S)
++
++        # Start heartbeat/watchdog in the background.
++        heartbeat_task = asyncio.create_task(_heartbeat_loop())
++
++        def _on_heartbeat_done(task: asyncio.Task) -> None:
++            if shutdown_event.is_set():
++                return
++            if task.cancelled():
++                logger.log_warn("[Main] Heartbeat task cancelled.")
++                return
++            exc = task.exception()
++            if exc:
++                tb = "".join(
++                    traceback.format_exception(type(exc), exc, exc.__traceback__)
++                )
++                logger.log_error(f"[Main] Heartbeat task crashed: {exc}\n{tb}")
++                # Recreate heartbeat if it ever dies.
++                nonlocal heartbeat_task
++                heartbeat_task = asyncio.create_task(_heartbeat_loop())
++                heartbeat_task.add_done_callback(_on_heartbeat_done)
++
++        heartbeat_task.add_done_callback(_on_heartbeat_done)
+ 
+         while True:
++            if shutdown_event.is_set():
++                logger.log_info("[Main] Shutdown event set. Exiting main loop.")
++                break
++
+             try:
+-                # 1. Connect and initialize services
++                # 1) Connect and initialize services
+                 if not feed.is_connected:
+-                    if not await feed.connect():
++                    async with feed_connect_lock:
++                        ok = await feed.connect()
++                    if not ok:
+                         logger.log_warn("Connection failed. Retrying in 15 seconds...")
+                         await asyncio.sleep(15)
+                         continue
+-                    else:
+-                        logger.log_info("Connection successful. Initializing services.")
+-                        executor = OrderExecutor(feed.api_client, logger, tracker)
+-                        harvester = MarketHarvester(feed.api_client, logger)
+-                        asyncio.create_task(harvester.run_harvest_loop())
+-                        logger.log_info("MarketHarvester started in the background.")
+-
+-                # 2. Refresh tickers
++
++                    logger.log_info("Connection successful. Initializing services.")
++                    executor = OrderExecutor(feed.api_client, logger, tracker)
++                    await _start_or_restart_harvester("feed connected")
++
++                # 2) Refresh tickers
+                 now = time.time()
+-                if not tickers or (now - last_ticker_refresh_time > TICKER_REFRESH_INTERVAL):
++                if (not tickers) or (now - last_ticker_refresh_time > TICKER_REFRESH_INTERVAL):
+                     logger.log_info("Refreshing ticker list from database...")
+-                    tickers = await feed.get_active_tickers()
++                    try:
++                        tickers = await feed.get_active_tickers()
++                    except Exception as e:
++                        logger.log_warn(f"Ticker refresh failed (transient): {e}")
++                        await asyncio.sleep(10)
++                        continue
++
+                     last_ticker_refresh_time = now
+                     if not tickers:
+                         logger.log_warn("Could not refresh tickers. Retrying in 60s.")
+@@ -67,65 +621,104 @@ async def amain():
+                         continue
+                     logger.log_info(f"Scanner Update: Tracking {len(tickers)} markets.")
+ 
+-                # 3. Poll, Enrich, Record, and Analyze
++                # 3) Poll, Enrich, Record, and Analyze
+                 for ticker in tickers:
+-                    market_data = await feed.poll_orderbook(ticker)
++                    if shutdown_event.is_set():
++                        break
+ 
+-                    if market_data and market_data.get('bid') is not None:
+-                        # --- AI-DATA UPGRADE ---
+-                        # 3a. Enrich data with features
++                    market_data = await feed.poll_orderbook(ticker)
++                    if market_data and market_data.get("bid") is not None:
+                         enriched_data = feature_extractor.transform(market_data)
+-                        
+-                        # 3b. Record enriched data with metadata for TFT training
++
+                         await recorder.record(
+                             enriched_data=enriched_data,
+-                            category=market_data['category'],
+-                            series_ticker=market_data['series_ticker'],
+-                            status=market_data['status']
++                            category=market_data["category"],
++                            series_ticker=market_data["series_ticker"],
++                            status=market_data["status"],
+                         )
+-                        # --- END UPGRADE ---
+ 
+-                        # Update portfolio valuation with the latest market price
+-                        tracker.update_valuation(ticker, enriched_data['bid'])
++                        tracker.update_valuation(ticker, enriched_data["bid"])
+ 
+-                        # Standard strategy execution
+                         if executor:
+                             try:
+-                                signal = strategy.analyze_ticker(enriched_data)
+-                                if signal:
+-                                    logger.log_info(f"STRATEGY SIGNAL for {ticker}: {signal}")
++                                signal_out = strategy.analyze_ticker(enriched_data)
++                                if signal_out:
++                                    logger.log_info(
++                                        f"STRATEGY SIGNAL for {ticker}: {signal_out}"
++                                    )
+                                     await executor.place_limit_order(
+                                         ticker=ticker,
+-                                        side=signal['side'],
++                                        side=signal_out["side"],
+                                         count=1,
+-                                        price=signal['price']
++                                        price=signal_out["price"],
+                                     )
+                             except Exception as e:
+-                                logger.log_error(f"Error during strategy/execution for {ticker}: {e}")
++                                logger.log_error(
++                                    f"Error during strategy/execution for {ticker}: {e}"
++                                )
+ 
+-                # 4. Log portfolio summary
++                # 4) Log portfolio summary
+                 logger.log_info(tracker.get_portfolio_summary())
+ 
+-                # 5. Wait for the next cycle
++                # 5) Wait for next cycle
+                 await asyncio.sleep(ORDERBOOK_POLL_INTERVAL)
+ 
+             except Exception as e:
+-                logger.log_error(f"An unexpected error occurred in the main loop: {e}")
++                tb = traceback.format_exc()
++                logger.log_error(f"[Main] Main loop error: {e}\n{tb}")
+                 logger.log_info("Resetting connection and restarting loop in 10 seconds...")
+-                if feed:
+-                    feed.is_connected = False
++                feed.is_connected = False
+                 executor = None
+                 await asyncio.sleep(10)
++
+     finally:
++        shutdown_event.set()
++
++        if heartbeat_task:
++            heartbeat_task.cancel()
++            with suppress(asyncio.CancelledError):
++                await heartbeat_task
++
++        for task in list(harvester_tasks):
++            task.cancel()
++        for task in list(harvester_tasks):
++            with suppress(asyncio.CancelledError):
++                try:
++                    await asyncio.wait_for(task, timeout=5.0)
++                except asyncio.TimeoutError:
++                    pass
++                except Exception:
++                    pass
++
++        # Executors: don't wait for hung threads (we enforce HTTP timeouts + circuit breaker).
++        if api_executor:
++            with suppress(Exception):
++                api_executor.shutdown(wait=False, cancel_futures=True)
++        if db_read_executor:
++            with suppress(Exception):
++                db_read_executor.shutdown(wait=False, cancel_futures=True)
++        if db_write_executor:
++            with suppress(Exception):
++                db_write_executor.shutdown(wait=False, cancel_futures=True)
++        if db_health_executor:
++            with suppress(Exception):
++                db_health_executor.shutdown(wait=False, cancel_futures=True)
++
+         if recorder:
+             logger.log_info("Flushing any remaining data before exit...")
+             await recorder.close()
+ 
++        logger.log_info(f"[Main] Exiting (reason: {exit_reason}).")
++
+ 
+ if __name__ == "__main__":
++    logger.log_info("[Main] Process starting.")
+     try:
+         asyncio.run(amain())
+     except KeyboardInterrupt:
+-        logger.log_info("\nShutdown signal received. Exiting gracefully.")
++        logger.log_info("[Main] KeyboardInterrupt received. Exiting.")
+     except Exception as e:
+-        logger.log_error(f"A fatal, unhandled exception occurred: {e}")
+\ No newline at end of file
++        tb = traceback.format_exc()
++        logger.log_error(f"[Main] Fatal, unhandled exception: {e}\n{tb}")
++    finally:
++        logger.log_info("[Main] Process exiting.")
+diff --git a/scripts/check_obi.py b/scripts/check_obi.py
+old mode 100644
+new mode 100755
+index c342638..0931275
+--- a/scripts/check_obi.py
++++ b/scripts/check_obi.py
+@@ -1,12 +1,12 @@
+ import argparse
+ import time
+ import pandas as pd
+-from services.db import DatabaseManager, DB_PATH
++from services.db import DatabaseManager, OBI_DB_PATH
+ 
+ 
+ def check_obi_data(show_count: bool = False):
+-    db = DatabaseManager()
+-    print(f"[check_obi] Using DB: {DB_PATH}")
++    db = DatabaseManager(db_path=OBI_DB_PATH, schema="obi")
++    print(f"[check_obi] Using OBI DB: {OBI_DB_PATH}")
+ 
+     # Query to see the latest OBI captures
+     query = """
+@@ -23,7 +23,7 @@ def check_obi_data(show_count: bool = False):
+     """
+ 
+     try:
+-        with db.get_connection() as conn:
++        with db.get_connection(role="read") as conn:
+             df = pd.read_sql_query(query, conn)
+ 
+         if df.empty:
+@@ -44,7 +44,7 @@ def check_obi_data(show_count: bool = False):
+     if show_count:
+         try:
+             now = time.time()
+-            with db.get_connection() as conn:
++            with db.get_connection(role="read") as conn:
+                 total = conn.execute(
+                     "SELECT COUNT(*) as total FROM market_obi"
+                 ).fetchone()["total"]
+diff --git a/scripts/obi_tracker.py b/scripts/obi_tracker.py
+old mode 100644
+new mode 100755
+index 5e50624..bddb091
+--- a/scripts/obi_tracker.py
++++ b/scripts/obi_tracker.py
+@@ -1,5 +1,6 @@
+ import asyncio
+ import json
++import os
+ import random
+ import time
+ import urllib.error
+@@ -12,7 +13,7 @@ from kalshi_python import ApiClient, Configuration
+ from kalshi_python.api import markets_api
+ 
+ from config import AppConfig
+-from services.db import DatabaseManager
++from services.db import DatabaseManager, DB_PATH, OBI_DB_PATH
+ from services.kalshi_signing import build_auth_headers
+ from utils.logger import logger
+ 
+@@ -27,7 +28,9 @@ class ObiTracker:
+ 
+     def __init__(self):
+         self.config = AppConfig()
+-        self.db = DatabaseManager()
++        self.db_primary = DatabaseManager(db_path=DB_PATH, schema="primary")
++        self.db_obi = DatabaseManager(db_path=OBI_DB_PATH, schema="obi")
++        self._obi_db_split = OBI_DB_PATH != DB_PATH
+ 
+         self.api_client: Optional[ApiClient] = None
+         self.market_api: Optional[markets_api.MarketsApi] = None
+@@ -117,7 +120,7 @@ class ObiTracker:
+             LIMIT ?
+         """
+ 
+-        with self.db.get_connection() as conn:
++        with self.db_primary.get_connection(role="read") as conn:
+             rows = conn.execute(query, (cutoff_time, limit)).fetchall()
+ 
+         tickers: List[str] = []
+@@ -393,10 +396,10 @@ class ObiTracker:
+         global_cooldown = max(2.0, global_cooldown)
+         global_cooldown *= random.uniform(0.8, 1.2)
+         try:
+-            current = self.db.get_rate_limit_cooldown_until()
++            current = self.db_primary.get_rate_limit_cooldown_until()
+             target = now + global_cooldown
+             if target > current:
+-                self.db.set_rate_limit_cooldown_until(target)
++                self.db_primary.set_rate_limit_cooldown_until(target)
+         except Exception as e:
+             self._log_throttled(
+                 f"[ObiTracker] Failed to write global cooldown: {e}",
+@@ -458,7 +461,7 @@ class ObiTracker:
+ 
+             while True:
+                 now = time.time()
+-                cooldown_until = max(self._global_cooldown_until, self.db.get_rate_limit_cooldown_until())
++                cooldown_until = max(self._global_cooldown_until, self.db_primary.get_rate_limit_cooldown_until())
+                 if now < cooldown_until:
+                     if now - self._last_global_cooldown_log_ts >= 10.0:
+                         self._last_global_cooldown_log_ts = now
+@@ -536,7 +539,7 @@ class ObiTracker:
+                 (t, ts, obi["bid_count"], obi["ask_count"], obi["best_bid"], obi["best_ask"]))
+ 
+         if obi_rows:
+-            self.db.bulk_upsert_obi(obi_rows)
++            self.db_obi.bulk_upsert_obi(obi_rows)
+ 
+         return len(obi_rows), fetched, empty, rate_limited, errors
+ 
+@@ -606,6 +609,10 @@ class ObiTracker:
+             await asyncio.sleep(max(0.0, 1.0 - elapsed))
+ 
+     async def run(self):
++        logger.log_info(
++            f"[ObiTracker] Startup: pid={os.getpid()}, cwd={os.getcwd()}, "
++            f"db_primary={DB_PATH} db_obi={OBI_DB_PATH}"
++        )
+         if not self._connect_api():
+             return
+ 
+diff --git a/services/db.py b/services/db.py
+old mode 100644
+new mode 100755
+index ea6f5a1..3292ffe
+--- a/services/db.py
++++ b/services/db.py
+@@ -1,155 +1,491 @@
+-import sqlite3
++import atexit
+ import os
++import random
++import sqlite3
++import threading
+ import time
+-from typing import List, Tuple
+ from contextlib import contextmanager
++from dataclasses import dataclass
++from pathlib import Path
++from typing import Dict, Iterator, List, Sequence, Tuple, Callable, Optional
++
++from utils.logger import logger
++
++def _env_flag(name: str) -> bool:
++    value = (os.getenv(name) or "").strip().lower()
++    return value in ("1", "true", "yes", "y", "on")
++
++
++def _resolve_path(value: str, *, base: Optional[Path] = None) -> Path:
++    p = Path(os.path.expanduser(value))
++    if not p.is_absolute():
++        p = (base or Path.cwd()) / p
++    return p.resolve(strict=False)
++
++
++def _default_repo_root() -> Path:
++    # Canonical "production" location (internal SSD / APFS).
++    return (Path.home() / "ev" / "Project_K").resolve(strict=False)
++
++
++def resolve_repo_root() -> Path:
++    env_root = os.getenv("PROJECT_K_ROOT")
++    if env_root:
++        return _resolve_path(env_root)
++    return _default_repo_root()
++
++
++REPO_ROOT = resolve_repo_root()
++
++ENV_DATA_DIR = os.getenv("PROJECT_K_DATA_DIR")
++if ENV_DATA_DIR:
++    DATA_DIR = _resolve_path(ENV_DATA_DIR, base=REPO_ROOT)
++else:
++    DATA_DIR = (REPO_ROOT / "data").resolve(strict=False)
++
++ENV_DB_PATH = os.getenv("PROJECT_K_DB_PATH")
++if ENV_DB_PATH:
++    DB_PATH = _resolve_path(ENV_DB_PATH, base=REPO_ROOT)
++else:
++    DB_PATH = (DATA_DIR / "kalshi.db").resolve(strict=False)
++
++ENV_OBI_DB_PATH = os.getenv("PROJECT_K_OBI_DB_PATH")
++if ENV_OBI_DB_PATH:
++    OBI_DB_PATH = _resolve_path(ENV_OBI_DB_PATH, base=REPO_ROOT)
++else:
++    OBI_DB_PATH = DB_PATH
++
++ENV_TRAINING_DIR = os.getenv("PROJECT_K_TRAINING_DIR")
++if ENV_TRAINING_DIR:
++    TRAINING_DIR = _resolve_path(ENV_TRAINING_DIR, base=REPO_ROOT)
++else:
++    # Large append-only parquet output goes on the external volume by default.
++    TRAINING_DIR = Path("/Volumes/external/ev/Project_K/data/training").resolve(strict=False)
++
++ALLOW_EXTERNAL_DB = _env_flag("ALLOW_EXTERNAL_DB")
++TRAINING_FALLBACK_LOCAL = _env_flag("TRAINING_FALLBACK_LOCAL")
++
++
++def _is_under(path: Path, parent: Path) -> bool:
++    try:
++        path.relative_to(parent)
++        return True
++    except Exception:
++        return False
++
++
++def validate_db_path_or_raise(db_path: Path, *, label: str) -> None:
++    db_path = Path(db_path).resolve(strict=False)
++
++    home = Path.home().resolve(strict=False)
++    if not _is_under(db_path, home):
++        if ALLOW_EXTERNAL_DB:
++            logger.log_warn(
++                f"[DB] ALLOW_EXTERNAL_DB=1 set; using external {label} path: {db_path}"
++            )
++            return
++        logger.log_error(f"[DB] Refusing to use external {label} path: {db_path}")
++        raise RuntimeError(
++            f"Refusing to use external {label} path: {db_path}. "
++            "Set PROJECT_K_DB_PATH / PROJECT_K_OBI_DB_PATH to a path under your home directory, "
++            "or set ALLOW_EXTERNAL_DB=1 to override."
++        )
++
++    if str(db_path).startswith("/Volumes/"):
++        if ALLOW_EXTERNAL_DB:
++            logger.log_warn(
++                f"[DB] ALLOW_EXTERNAL_DB=1 set; using {label} under /Volumes: {db_path}"
++            )
++            return
++        logger.log_error(f"[DB] Refusing to use {label} under /Volumes: {db_path}")
++        raise RuntimeError(
++            f"Refusing to use {label} under /Volumes: {db_path}. "
++            "Move the SQLite DB to local disk (e.g., ~/ev/Project_K/data/kalshi.db) "
++            "or set ALLOW_EXTERNAL_DB=1 to override."
++        )
++
++
++def ensure_training_dir() -> Path:
++    training_dir = Path(TRAINING_DIR)
++    external_root = Path("/Volumes/external")
++
++    if _is_under(training_dir, external_root) and not external_root.exists():
++        if TRAINING_FALLBACK_LOCAL:
++            fallback = (REPO_ROOT / "data" / "training_staging").resolve(strict=False)
++            fallback.mkdir(parents=True, exist_ok=True)
++            logger.log_warn(
++                f"[Training] External volume not mounted. Falling back to local staging: {fallback} "
++                "(set TRAINING_FALLBACK_LOCAL=0 to fail fast)."
++            )
++            return fallback
++        raise RuntimeError(
++            "Training directory is on /Volumes/external but the volume is not mounted. "
++            "Mount /Volumes/external or set TRAINING_FALLBACK_LOCAL=1 to write to "
++            "~/ev/Project_K/data/training_staging."
++        )
++
++    try:
++        training_dir.mkdir(parents=True, exist_ok=True)
++    except Exception as e:
++        if TRAINING_FALLBACK_LOCAL:
++            fallback = (REPO_ROOT / "data" / "training_staging").resolve(strict=False)
++            fallback.mkdir(parents=True, exist_ok=True)
++            logger.log_warn(
++                f"[Training] Failed to create training dir ({training_dir}): {e}. "
++                f"Falling back to local staging: {fallback}"
++            )
++            return fallback
++        raise RuntimeError(
++            f"Failed to create training directory: {training_dir}: {e}"
++        ) from e
++
++    return training_dir
++
++
++# Validate configuration at import time so all entrypoints agree early.
++validate_db_path_or_raise(DB_PATH, label="primary DB")
++if Path(OBI_DB_PATH) != Path(DB_PATH):
++    validate_db_path_or_raise(OBI_DB_PATH, label="OBI DB")
++
++_LOCKED_SNIPPETS = (
++    "database is locked",
++    "database table is locked",
++    "database schema is locked",
++)
++
++
++@dataclass
++class _ConnEntry:
++    conn: sqlite3.Connection
++    version: int
++    db_path: Path
++    role: str
++    closed: bool = False
+ 
+-REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+-DB_PATH = os.path.join(REPO_ROOT, "data", "kalshi.db")
++
++def _iter_chunks(rows: Sequence[Tuple], chunk_size: int) -> Iterator[Sequence[Tuple]]:
++    if chunk_size <= 0:
++        raise ValueError("chunk_size must be > 0")
++    for i in range(0, len(rows), chunk_size):
++        yield rows[i : i + chunk_size]
+ 
+ 
+ class DatabaseManager:
+-    def __init__(self):
++    _tls = threading.local()
++    _global_lock = threading.Lock()
++    _global_entries: Dict[Tuple[int, str, str], _ConnEntry] = {}
++    _cache_version: int = 0
++    _atexit_registered: bool = False
++
++    def __init__(self, db_path: Optional[Path] = None, *, schema: str = "primary"):
++        self.db_path = Path(db_path or DB_PATH).resolve(strict=False)
++        self.schema = schema
++
+         self._ensure_db_exists()
++        self._register_atexit_once()
++
++    @classmethod
++    def _register_atexit_once(cls) -> None:
++        if cls._atexit_registered:
++            return
++        cls._atexit_registered = True
++        atexit.register(cls.close_all_cached_connections)
++
++    @classmethod
++    def reset_connection_cache(cls) -> None:
++        with cls._global_lock:
++            cls._cache_version += 1
++        cls.close_all_cached_connections()
++
++    @classmethod
++    def close_all_cached_connections(cls) -> None:
++        with cls._global_lock:
++            entries = list(cls._global_entries.values())
++            cls._global_entries.clear()
++
++        for entry in entries:
++            cls._close_entry(entry)
++
++    @classmethod
++    def _close_entry(cls, entry: _ConnEntry) -> None:
++        if entry.closed:
++            return
++        entry.closed = True
++        try:
++            entry.conn.close()
++        except Exception:
++            pass
++
++    def _normalize_role(self, role: str) -> str:
++        r = (role or "").strip().lower()
++        if r in ("w", "write", "writer"):
++            return "write"
++        if r in ("r", "read", "reader"):
++            return "read"
++        if r in ("h", "health"):
++            return "health"
++        raise ValueError(f"Unknown DB role: {role!r}")
++
++    def _connection_params(self, role: str) -> Tuple[float, int, bool]:
++        role = self._normalize_role(role)
++        if role == "write":
++            return 30.0, 30000, False
++        if role == "read":
++            return 3.0, 2000, True
++        return 2.0, 1000, True
++
++    def _open_connection(self, role: str) -> sqlite3.Connection:
++        connect_timeout_s, busy_timeout_ms, query_only = self._connection_params(role)
++        conn = sqlite3.connect(
++            str(self.db_path),
++            timeout=connect_timeout_s,
++            check_same_thread=False,
++        )
++        conn.row_factory = sqlite3.Row
++
++        conn.execute("PRAGMA journal_mode=WAL;")
++        conn.execute("PRAGMA synchronous=NORMAL;")
++        conn.execute("PRAGMA foreign_keys=ON;")
++        conn.execute("PRAGMA temp_store=MEMORY;")
++        conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)};")
++        conn.execute(f"PRAGMA query_only={1 if query_only else 0};")
++        return conn
++
++    def _get_thread_cache(self) -> Dict[Tuple[str, str], _ConnEntry]:
++        cache = getattr(self._tls, "cache", None)
++        if cache is None:
++            cache = {}
++            setattr(self._tls, "cache", cache)
++        return cache
++
++    def _get_cached_connection(self, role: str) -> sqlite3.Connection:
++        role = self._normalize_role(role)
++        cache = self._get_thread_cache()
++        key = (str(self.db_path), role)
++
++        entry = cache.get(key)
++        if entry and (not entry.closed) and entry.version == self._cache_version:
++            return entry.conn
++
++        if entry:
++            self._close_entry(entry)
++
++        conn = self._open_connection(role)
++        entry = _ConnEntry(
++            conn=conn,
++            version=self._cache_version,
++            db_path=self.db_path,
++            role=role,
++            closed=False,
++        )
++        cache[key] = entry
++
++        with self._global_lock:
++            gkey = (threading.get_ident(), str(self.db_path), role)
++            old = self._global_entries.get(gkey)
++            if old and old is not entry:
++                self._close_entry(old)
++            self._global_entries[gkey] = entry
++
++        return conn
++
++    def _is_locked_error(self, exc: Exception) -> bool:
++        msg = str(exc).lower()
++        return any(snippet in msg for snippet in _LOCKED_SNIPPETS)
++
++    def _run_with_retry(
++        self,
++        op: Callable[[], None],
++        *,
++        total_timeout_s: float = 5.0,
++        base_delay_s: float = 0.1,
++        max_delay_s: float = 1.0,
++    ) -> bool:
++        start = time.time()
++        delay = base_delay_s
++
++        while True:
++            try:
++                op()
++                return True
++            except sqlite3.OperationalError as e:
++                if not self._is_locked_error(e):
++                    raise
++
++                elapsed = time.time() - start
++                if elapsed >= total_timeout_s:
++                    logger.log_error(
++                        f"[DB] database is locked for {elapsed:.1f}s (db={self.db_path}). Giving up."
++                    )
++                    return False
++
++                # Exponential backoff + small jitter to reduce synchronized retries.
++                sleep_for = min(delay, max(0.0, total_timeout_s - elapsed))
++                sleep_for += random.uniform(0.0, min(0.2, sleep_for * 0.2))
++                time.sleep(max(0.01, sleep_for))
++                delay = min(max_delay_s, delay * 2.0)
+ 
+     def _ensure_db_exists(self):
+-        """Creates the new two-table schema if it doesn't exist."""
+-        os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+-
+-        with self.get_connection() as conn:
+-            cursor = conn.cursor()
+-
+-            # --- Table A: market_metrics (Broad View) ---
+-            cursor.execute("""
+-                CREATE TABLE IF NOT EXISTS market_metrics (
+-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+-                    ticker TEXT NOT NULL,
+-                    timestamp REAL NOT NULL,
+-                    volume INTEGER,
+-                    open_interest INTEGER,
+-                    spread INTEGER,
+-                    best_bid INTEGER,
+-                    best_ask INTEGER,
+-                    status TEXT,
+-                    UNIQUE(ticker)
+-                )
+-            """)
+-            cursor.execute(
+-                "CREATE INDEX IF NOT EXISTS idx_metrics_timestamp ON market_metrics(timestamp)")
+-            cursor.execute(
+-                "CREATE INDEX IF NOT EXISTS idx_metrics_volume ON market_metrics(volume)")
+-
+-            # --- Table B: market_obi (Deep View) ---
+-            cursor.execute("""
+-                CREATE TABLE IF NOT EXISTS market_obi (
+-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+-                    ticker TEXT NOT NULL,
+-                    timestamp REAL NOT NULL,
+-                    bid_count INTEGER,
+-                    ask_count INTEGER,
+-                    best_bid INTEGER,
+-                    best_ask INTEGER,
+-                    UNIQUE(ticker)
+-                )
+-            """)
+-            cursor.execute(
+-                "CREATE INDEX IF NOT EXISTS idx_obi_ticker ON market_obi(ticker)")
+-
+-            # --- Metadata Tables (Unchanged) ---
+-            cursor.execute("""
+-                CREATE TABLE IF NOT EXISTS series_registry (
+-                    series_ticker TEXT PRIMARY KEY,
+-                    title TEXT,
+-                    category TEXT,
+-                    frequency TEXT
+-                )
+-            """)
+-            cursor.execute("""
+-                CREATE TABLE IF NOT EXISTS market_registry (
+-                    ticker TEXT PRIMARY KEY,
+-                    series_ticker TEXT,
+-                    expiration_time TEXT,
+-                    FOREIGN KEY(series_ticker) REFERENCES series_registry(series_ticker)
+-                )
+-            """)
+-            cursor.execute("""
+-                CREATE TABLE IF NOT EXISTS rate_limit_state (
+-                    key TEXT PRIMARY KEY,
+-                    value REAL
+-                )
+-            """)
+-            conn.commit()
++        """Creates the schema if it doesn't exist."""
++        self.db_path.parent.mkdir(parents=True, exist_ok=True)
++
++        def _op() -> None:
++            with self.get_connection(role="write") as conn:
++                cursor = conn.cursor()
++
++                if self.schema not in ("primary", "obi"):
++                    raise ValueError(f"Unknown DB schema: {self.schema!r}")
++
++                if self.schema == "primary":
++                    cursor.execute("""
++                        CREATE TABLE IF NOT EXISTS market_metrics (
++                            id INTEGER PRIMARY KEY AUTOINCREMENT,
++                            ticker TEXT NOT NULL,
++                            timestamp REAL NOT NULL,
++                            volume INTEGER,
++                            open_interest INTEGER,
++                            spread INTEGER,
++                            best_bid INTEGER,
++                            best_ask INTEGER,
++                            status TEXT,
++                            UNIQUE(ticker)
++                        )
++                    """)
++                    cursor.execute(
++                        "CREATE INDEX IF NOT EXISTS idx_metrics_timestamp ON market_metrics(timestamp)")
++                    cursor.execute(
++                        "CREATE INDEX IF NOT EXISTS idx_metrics_volume ON market_metrics(volume)")
++
++                    cursor.execute("""
++                        CREATE TABLE IF NOT EXISTS series_registry (
++                            series_ticker TEXT PRIMARY KEY,
++                            title TEXT,
++                            category TEXT,
++                            frequency TEXT
++                        )
++                    """)
++                    cursor.execute("""
++                        CREATE TABLE IF NOT EXISTS market_registry (
++                            ticker TEXT PRIMARY KEY,
++                            series_ticker TEXT,
++                            expiration_time TEXT,
++                            FOREIGN KEY(series_ticker) REFERENCES series_registry(series_ticker)
++                        )
++                    """)
++
++                    cursor.execute("""
++                        CREATE TABLE IF NOT EXISTS rate_limit_state (
++                            key TEXT PRIMARY KEY,
++                            value REAL
++                        )
++                    """)
++
++                cursor.execute("""
++                    CREATE TABLE IF NOT EXISTS market_obi (
++                        id INTEGER PRIMARY KEY AUTOINCREMENT,
++                        ticker TEXT NOT NULL,
++                        timestamp REAL NOT NULL,
++                        bid_count INTEGER,
++                        ask_count INTEGER,
++                        best_bid INTEGER,
++                        best_ask INTEGER,
++                        UNIQUE(ticker)
++                    )
++                """)
++                cursor.execute(
++                    "CREATE INDEX IF NOT EXISTS idx_obi_ticker ON market_obi(ticker)")
++                conn.commit()
++
++        self._run_with_retry(_op, total_timeout_s=5.0)
+ 
+     @contextmanager
+-    def get_connection(self):
+-        """Yields a connection context with WAL mode enabled."""
+-        conn = sqlite3.connect(DB_PATH, timeout=10, check_same_thread=False)
+-        conn.row_factory = sqlite3.Row
++    def get_connection(self, *, role: str = "write"):
++        conn = self._get_cached_connection(role)
+         try:
+-            conn.execute("PRAGMA journal_mode=WAL;")
+-            conn.execute("PRAGMA busy_timeout=5000;")
+             yield conn
+-        finally:
+-            conn.close()
++        except Exception:
++            try:
++                conn.rollback()
++            except Exception:
++                pass
++            raise
+ 
+-    def bulk_upsert_metrics(self, market_data: List[Tuple]):
++    def bulk_upsert_metrics(self, market_data: List[Tuple]) -> bool:
+         """Upserts market metrics data from the Discovery Loop."""
+         if not market_data:
+-            return
++            return False
+ 
+-        with self.get_connection() as conn:
+-            conn.executemany("""
+-                INSERT INTO market_metrics (ticker, timestamp, volume, open_interest, spread, best_bid, best_ask, status)
+-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+-                ON CONFLICT(ticker) DO UPDATE SET
+-                    timestamp=excluded.timestamp,
+-                    volume=excluded.volume,
+-                    open_interest=excluded.open_interest,
+-                    spread=excluded.spread,
+-                    best_bid=excluded.best_bid,
+-                    best_ask=excluded.best_ask,
+-                    status=excluded.status
+-            """, market_data)
+-            conn.commit()
++        chunk_size = 250
++        def _op() -> None:
++            with self.get_connection(role="write") as conn:
++                for chunk in _iter_chunks(market_data, chunk_size):
++                    conn.executemany("""
++                        INSERT INTO market_metrics (ticker, timestamp, volume, open_interest, spread, best_bid, best_ask, status)
++                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
++                        ON CONFLICT(ticker) DO UPDATE SET
++                            timestamp=excluded.timestamp,
++                            volume=excluded.volume,
++                            open_interest=excluded.open_interest,
++                            spread=excluded.spread,
++                            best_bid=excluded.best_bid,
++                            best_ask=excluded.best_ask,
++                            status=excluded.status
++                    """, chunk)
++                    conn.commit()
++
++        return self._run_with_retry(_op, total_timeout_s=5.0)
+ 
+-    def bulk_upsert_obi(self, obi_data: List[Tuple]):
++    def bulk_upsert_obi(self, obi_data: List[Tuple]) -> bool:
+         """Upserts order book imbalance data from the Tracking Loop."""
+         if not obi_data:
+-            return
++            return False
+ 
+-        with self.get_connection() as conn:
+-            conn.executemany("""
+-                INSERT INTO market_obi (ticker, timestamp, bid_count, ask_count, best_bid, best_ask)
+-                VALUES (?, ?, ?, ?, ?, ?)
+-                ON CONFLICT(ticker) DO UPDATE SET
+-                    timestamp=excluded.timestamp,
+-                    bid_count=excluded.bid_count,
+-                    ask_count=excluded.ask_count,
+-                    best_bid=excluded.best_bid,
+-                    best_ask=excluded.best_ask
+-            """, obi_data)
+-            conn.commit()
++        chunk_size = 500
++        def _op() -> None:
++            with self.get_connection(role="write") as conn:
++                for chunk in _iter_chunks(obi_data, chunk_size):
++                    conn.executemany("""
++                        INSERT INTO market_obi (ticker, timestamp, bid_count, ask_count, best_bid, best_ask)
++                        VALUES (?, ?, ?, ?, ?, ?)
++                        ON CONFLICT(ticker) DO UPDATE SET
++                            timestamp=excluded.timestamp,
++                            bid_count=excluded.bid_count,
++                            ask_count=excluded.ask_count,
++                            best_bid=excluded.best_bid,
++                            best_ask=excluded.best_ask
++                    """, chunk)
++                    conn.commit()
++
++        return self._run_with_retry(_op, total_timeout_s=5.0)
+ 
+-    def upsert_metadata(self, series_data: List[Tuple], market_reg_data: List[Tuple]):
++    def upsert_metadata(self, series_data: List[Tuple], market_reg_data: List[Tuple]) -> bool:
+         """Updates the static registries."""
+-        with self.get_connection() as conn:
+-            if series_data:
+-                conn.executemany("""
+-                    INSERT OR IGNORE INTO series_registry (series_ticker, title, category, frequency)
+-                    VALUES (?, ?, ?, ?)
+-                """, series_data)
+-
+-            if market_reg_data:
+-                conn.executemany("""
+-                    INSERT OR IGNORE INTO market_registry (ticker, series_ticker, expiration_time)
+-                    VALUES (?, ?, ?)
+-                """, market_reg_data)
+-            conn.commit()
++
++        chunk_size = 500
++        def _op() -> None:
++            with self.get_connection(role="write") as conn:
++                if series_data:
++                    for chunk in _iter_chunks(series_data, chunk_size):
++                        conn.executemany("""
++                            INSERT OR IGNORE INTO series_registry (series_ticker, title, category, frequency)
++                            VALUES (?, ?, ?, ?)
++                        """, chunk)
++                        conn.commit()
++
++                if market_reg_data:
++                    for chunk in _iter_chunks(market_reg_data, chunk_size):
++                        conn.executemany("""
++                            INSERT OR IGNORE INTO market_registry (ticker, series_ticker, expiration_time)
++                            VALUES (?, ?, ?)
++                        """, chunk)
++                        conn.commit()
++
++        if not series_data and not market_reg_data:
++            return False
++        return self._run_with_retry(_op, total_timeout_s=5.0)
+ 
+     def get_top_active_tickers(self, limit=50) -> List[str]:
+-        """
+-        Returns top active tickers by volume, aggregated over a 5-minute window.
+-        """
++        """Returns top active tickers by volume, aggregated over a 5-minute window."""
+         cutoff_time = time.time() - 300  # 5-minute window
+ 
+         query = """
+@@ -161,31 +497,26 @@ class DatabaseManager:
+             ORDER BY MAX(volume) DESC
+             LIMIT ?
+         """
+-        with self.get_connection() as conn:
+-            cursor = conn.cursor()
+-            rows = cursor.execute(query, (cutoff_time, limit)).fetchall()
++        with self.get_connection(role="read") as conn:
++            rows = conn.execute(query, (cutoff_time, limit)).fetchall()
+             return [row['ticker'] for row in rows]
+ 
+     def get_market_snapshot(self, ticker: str):
+         """Retrieves the latest snapshot for a ticker from the broad metrics table."""
+-        with self.get_connection() as conn:
+-            cursor = conn.cursor()
+-            row = cursor.execute(
++        with self.get_connection(role="read") as conn:
++            row = conn.execute(
+                 "SELECT * FROM market_metrics WHERE ticker = ?", (ticker,)).fetchone()
+             return dict(row) if row else None
+ 
+     def get_market_obi(self, ticker: str):
+         """Retrieves the latest OBI data for a ticker."""
+-        with self.get_connection() as conn:
+-            cursor = conn.cursor()
+-            row = cursor.execute(
++        with self.get_connection(role="read") as conn:
++            row = conn.execute(
+                 "SELECT * FROM market_obi WHERE ticker = ?", (ticker,)).fetchone()
+             return dict(row) if row else None
+ 
+     def get_combined_market_view(self, ticker: str):
+-        """
+-        Joins metrics and OBI data for a comprehensive view of a single ticker.
+-        """
++        """Joins metrics and OBI data for a comprehensive view of a single ticker."""
+         query = """
+             SELECT
+                 m.ticker,
+@@ -202,13 +533,12 @@ class DatabaseManager:
+             LEFT JOIN market_obi o ON o.ticker = m.ticker
+             WHERE m.ticker = ?
+         """
+-        with self.get_connection() as conn:
+-            cursor = conn.cursor()
+-            row = cursor.execute(query, (ticker,)).fetchone()
++        with self.get_connection(role="read") as conn:
++            row = conn.execute(query, (ticker,)).fetchone()
+             return dict(row) if row else None
+ 
+     def get_rate_limit_cooldown_until(self) -> float:
+-        with self.get_connection() as conn:
++        with self.get_connection(role="read") as conn:
+             row = conn.execute(
+                 "SELECT value FROM rate_limit_state WHERE key = ?",
+                 ("kalshi_global_cooldown_until",)
+@@ -216,10 +546,23 @@ class DatabaseManager:
+             return float(row["value"]) if row and row["value"] is not None else 0.0
+ 
+     def set_rate_limit_cooldown_until(self, ts: float) -> None:
+-        with self.get_connection() as conn:
++        with self.get_connection(role="write") as conn:
+             conn.execute("""
+                 INSERT INTO rate_limit_state (key, value)
+                 VALUES (?, ?)
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value
+             """, ("kalshi_global_cooldown_until", float(ts)))
+             conn.commit()
++
++    def get_market_metrics_max_info(self, *, role: str = "health") -> Tuple[float, str]:
++        with self.get_connection(role=role) as conn:
++            row = conn.execute(
++                "SELECT MAX(timestamp) as ts, "
++                "datetime(MAX(timestamp),'unixepoch','localtime') as ts_local "
++                "FROM market_metrics"
++            ).fetchone()
++            if not row or row["ts"] is None:
++                return 0.0, "n/a"
++            ts = float(row["ts"])
++            ts_local = row["ts_local"] or "n/a"
++            return ts, ts_local
+diff --git a/services/feed.py b/services/feed.py
+old mode 100644
+new mode 100755
+index e4806b3..9f4787e
+--- a/services/feed.py
++++ b/services/feed.py
+@@ -1,25 +1,62 @@
+ import asyncio
+ from typing import Dict, Any, Optional
++
++from concurrent.futures import Executor
++import urllib3
+ from kalshi_python import ApiClient, Configuration
+ from kalshi_python.api import markets_api
++
+ from config import AppConfig
+ from utils.logger import Logger
+-from services.db import DatabaseManager
++from services.db import DatabaseManager, DB_PATH, OBI_DB_PATH
+ 
+ 
+ class MarketFeed:
+-    def __init__(self, config: AppConfig, logger: Logger):
++    def __init__(
++        self,
++        config: AppConfig,
++        logger: Logger,
++        *,
++        api_executor: Optional[Executor] = None,
++        db_read_executor: Optional[Executor] = None,
++        inflight_counters: Optional[object] = None,
++    ):
+         self.config = config
+         self.logger = logger
+         self.api_client = None
+         self.market_api = None
+         self.is_connected = False
+-        self.db = DatabaseManager()
++        self.db_primary = DatabaseManager(db_path=DB_PATH, schema="primary")
++        self.db_obi = DatabaseManager(db_path=OBI_DB_PATH, schema="obi")
++        self._obi_db_split = OBI_DB_PATH != DB_PATH
++        self.api_executor = api_executor
++        self.db_read_executor = db_read_executor
++        self._inflight = inflight_counters
++
++        # Real network timeouts (connect, read) for kalshi-python requests.
++        self._request_timeout = (5.0, 20.0)
++        self._connect_wait_timeout_s = 35.0
++
++    def set_executors(
++        self,
++        *,
++        api_executor: Optional[Executor] = None,
++        db_read_executor: Optional[Executor] = None,
++    ) -> None:
++        if api_executor is not None:
++            self.api_executor = api_executor
++        if db_read_executor is not None:
++            self.db_read_executor = db_read_executor
+ 
+     async def connect(self) -> bool:
+         self.logger.log_info(
+-            f"Initializing RSA Authentication ({self.config.KALSHI_ENV})...")
+-        host = "https://demo-api.kalshi.co/trade-api/v2" if self.config.KALSHI_ENV == "DEMO" else "https://api.elections.kalshi.com/trade-api/v2"
++            f"Initializing RSA Authentication ({self.config.KALSHI_ENV})..."
++        )
++        host = (
++            "https://demo-api.kalshi.co/trade-api/v2"
++            if self.config.KALSHI_ENV == "DEMO"
++            else "https://api.elections.kalshi.com/trade-api/v2"
++        )
+         api_config = Configuration()
+         api_config.host = host
+ 
+@@ -27,46 +64,154 @@ class MarketFeed:
+             self.api_client = ApiClient(api_config)
+             self.api_client.set_kalshi_auth(
+                 key_id=self.config.KALSHI_API_KEY_ID,
+-                private_key_path=self.config.KALSHI_PRIVATE_KEY_PATH
++                private_key_path=self.config.KALSHI_PRIVATE_KEY_PATH,
+             )
+             self.market_api = markets_api.MarketsApi(self.api_client)
+-            self.market_api.get_markets(limit=1, status="open")
++
++            # Connectivity check with *real* HTTP timeouts and a secondary asyncio timeout.
++            loop = asyncio.get_running_loop()
++            fut = loop.run_in_executor(
++                self.api_executor,
++                lambda: self.market_api.get_markets_with_http_info(
++                    limit=1,
++                    status="open",
++                    _request_timeout=self._request_timeout,
++                ).data,
++            )
++            await asyncio.wait_for(fut, timeout=self._connect_wait_timeout_s)
++
+             self.is_connected = True
+             self.logger.log_info("RSA Authentication Successful.")
+             return True
++        except asyncio.TimeoutError:
++            self.logger.log_error("RSA Authentication check timed out.")
++            self.is_connected = False
++            return False
++        except urllib3.exceptions.TimeoutError as e:
++            self.logger.log_error(f"RSA Authentication HTTP timeout: {e}")
++            self.is_connected = False
++            return False
+         except Exception as e:
+             self.logger.log_error(f"RSA Authentication Failed: {e}")
+             self.is_connected = False
+             return False
+ 
+     async def get_active_tickers(self):
+-        return self.db.get_top_active_tickers(limit=50)
++        loop = asyncio.get_running_loop()
++        if self._inflight is not None:
++            self._inflight.inflight_reads += 1
++        try:
++            return await loop.run_in_executor(
++                self.db_read_executor, lambda: self.db_primary.get_top_active_tickers(limit=50)
++            )
++        except Exception as e:
++            self.logger.log_warn(f"Ticker query failed: {e}")
++            return []
++        finally:
++            if self._inflight is not None:
++                self._inflight.inflight_reads = max(0, self._inflight.inflight_reads - 1)
+ 
+     async def poll_orderbook(self, ticker: str) -> Dict[str, Any]:
+-        """
+-        Reads the latest combined snapshot from the DB using the new accessor.
+-        """
++        """Reads the latest combined snapshot from the DB."""
+         try:
+             loop = asyncio.get_running_loop()
+-            # Use the new, safe accessor method from the DatabaseManager
+-            row = await loop.run_in_executor(None, self.db.get_combined_market_view, ticker)
++            if not self._obi_db_split:
++                if self._inflight is not None:
++                    self._inflight.inflight_reads += 1
++                try:
++                    row = await loop.run_in_executor(
++                        self.db_read_executor,
++                        self.db_primary.get_combined_market_view,
++                        ticker,
++                    )
++                finally:
++                    if self._inflight is not None:
++                        self._inflight.inflight_reads = max(
++                            0, self._inflight.inflight_reads - 1
++                        )
++
++                if not row:
++                    return {}
++
++                bid = row.get("best_bid")
++                ask = row.get("best_ask")
++                spread = row.get("spread")
++                if spread is None and bid is not None and ask is not None:
++                    spread = ask - bid
++
++                ts = row.get("obi_ts") or row.get("metrics_ts") or 0.0
+ 
+-            if row:
+                 return {
+-                    "ticker": row['ticker'],
+-                    "timestamp": row['obi_ts'],  # Prioritize OBI timestamp
+-                    "bid": row['best_bid'],
+-                    "ask": row['best_ask'],
+-                    "spread": row.get('spread', row['best_ask'] - row['best_bid']),
+-                    "volume": row.get('volume', 0),
+-                    "status": row.get('status', 'active'),
+-                    "series_ticker": row.get('series_ticker', 'unknown'),
+-                    "category": row.get('category', 'MISC'),
+-                    "bid_count": row.get('bid_count', 0),
+-                    "ask_count": row.get('ask_count', 0)
++                    "ticker": row.get("ticker", ticker),
++                    "timestamp": ts,
++                    "bid": bid,
++                    "ask": ask,
++                    "spread": spread or 0,
++                    "volume": row.get("volume", 0),
++                    "status": row.get("status", "active"),
++                    "series_ticker": row.get("series_ticker", "unknown"),
++                    "category": row.get("category", "MISC"),
++                    "bid_count": row.get("bid_count", 0),
++                    "ask_count": row.get("ask_count", 0),
+                 }
+-            return {}
++
++            if self._inflight is not None:
++                self._inflight.inflight_reads += 1
++            try:
++                metrics = await loop.run_in_executor(
++                    self.db_read_executor,
++                    self.db_primary.get_market_snapshot,
++                    ticker,
++                )
++            finally:
++                if self._inflight is not None:
++                    self._inflight.inflight_reads = max(
++                        0, self._inflight.inflight_reads - 1
++                    )
++
++            if not metrics:
++                return {}
++
++            if self._inflight is not None:
++                self._inflight.inflight_reads += 1
++            try:
++                obi = await loop.run_in_executor(
++                    self.db_read_executor,
++                    self.db_obi.get_market_obi,
++                    ticker,
++                )
++            finally:
++                if self._inflight is not None:
++                    self._inflight.inflight_reads = max(
++                        0, self._inflight.inflight_reads - 1
++                    )
++
++            bid = (obi or {}).get("best_bid")
++            ask = (obi or {}).get("best_ask")
++            if bid is None:
++                bid = metrics.get("best_bid")
++            if ask is None:
++                ask = metrics.get("best_ask")
++
++            spread = metrics.get("spread")
++            if spread is None and bid is not None and ask is not None:
++                spread = ask - bid
++
++            ts = (obi or {}).get("timestamp") or metrics.get("timestamp") or 0.0
++
++            return {
++                "ticker": ticker,
++                "timestamp": ts,
++                "bid": bid,
++                "ask": ask,
++                "spread": spread or 0,
++                "volume": metrics.get("volume", 0),
++                "status": metrics.get("status", "active"),
++                "series_ticker": "unknown",
++                "category": "MISC",
++                "bid_count": int((obi or {}).get("bid_count") or 0),
++                "ask_count": int((obi or {}).get("ask_count") or 0),
++            }
+         except Exception as e:
+             self.logger.log_error(f"DB poll failed for {ticker}: {e}")
+             return {}
+-
+diff --git a/services/harvester.py b/services/harvester.py
+old mode 100644
+new mode 100755
+index fd18637..44d1369
+--- a/services/harvester.py
++++ b/services/harvester.py
+@@ -1,29 +1,95 @@
+ import asyncio
+ import random
+ import time
++from collections import deque
++from concurrent.futures import Executor
+ from email.utils import parsedate_to_datetime
+-from typing import List, Any, Optional, Tuple
++from typing import List, Any, Optional, Tuple, Callable
++
++import urllib3
+ from kalshi_python.api import markets_api
++from kalshi_python import ApiClient
++
+ from services.db import DatabaseManager
+ from utils.logger import Logger
+-from kalshi_python import ApiClient
+ 
+ 
+ class MarketHarvester:
+-    """
+-    A dedicated "Discovery Engine" that scans all markets and populates the
+-    'market_metrics' table with volume, open interest, and spread data.
+-    The high-frequency tracking has been moved to a separate service.
+-    """
+-
+-    def __init__(self, api_client: ApiClient, logger: Logger):
++    """Discovery Engine: scans markets and upserts into market_metrics."""
++
++    def __init__(
++        self,
++        api_client: ApiClient,
++        logger: Logger,
++        generation: int = 0,
++        is_current: Optional[Callable[[int], bool]] = None,
++        api_executor: Optional[Executor] = None,
++        db_write_executor: Optional[Executor] = None,
++        db_read_executor: Optional[Executor] = None,
++        inflight_counters: Optional[object] = None,
++    ):
+         self.market_api = markets_api.MarketsApi(api_client)
+         self.logger = logger
+         self.db = DatabaseManager()
++
++        # Generation guard: main.py can restart harvesters and mark older ones stale.
++        self.generation = generation
++        self._is_current = is_current or (lambda _gen: True)
++
++        # Rate-limit state (shared across processes)
+         self._last_global_cooldown_log_ts: float = 0.0
+         self._harvest_429_count: int = 0
+         self._last_harvest_429_ts: float = 0.0
+ 
++        # Cycle / stall diagnostics
++        self._cycle_id: int = 0
++        self._last_metrics_write_ts: float = 0.0
++
++        # Executors (isolate API calls from DB work).
++        self._api_executor = api_executor
++        self._db_write_executor = db_write_executor
++        self._db_read_executor = db_read_executor
++        self._inflight = inflight_counters
++
++        # Timeouts + pacing
++        # IMPORTANT: enforce *real* HTTP timeouts via kalshi-python's `_request_timeout`.
++        self._request_timeout: Tuple[float, float] = (5.0, 20.0)  # (connect, read)
++        # Secondary protection: asyncio timeout must exceed HTTP timeouts to avoid leaking stuck threads.
++        self._api_wait_timeout_s: float = 35.0
++        self._timeout_backoff_s: float = 2.0
++        self._page_log_every: int = 50
++
++        # Timeout tracking for circuit breaking in main.py.
++        self._timeout_window_s: float = 120.0
++        self._timeout_events = deque()
++        self._consecutive_timeouts: int = 0
++
++    def get_timeout_stats(self) -> Tuple[int, int]:
++        """Returns: (timeouts_in_last_window, consecutive_timeouts)."""
++        now = time.time()
++        while self._timeout_events and now - self._timeout_events[0] > self._timeout_window_s:
++            self._timeout_events.popleft()
++        return len(self._timeout_events), self._consecutive_timeouts
++
++    def _record_timeout(self) -> None:
++        now = time.time()
++        self._timeout_events.append(now)
++        self._consecutive_timeouts += 1
++
++        # Prevent unbounded growth if the process runs for days.
++        while self._timeout_events and now - self._timeout_events[0] > (self._timeout_window_s * 2.0):
++            self._timeout_events.popleft()
++
++    def _record_success(self) -> None:
++        self._consecutive_timeouts = 0
++
++    def _still_current(self) -> bool:
++        try:
++            return bool(self._is_current(self.generation))
++        except Exception:
++            # If the guard function fails, stay alive rather than killing discovery.
++            return True
++
+     def _categorize(self, ticker: str, series_ticker: str) -> str:
+         t = str(ticker or "").upper()
+         s = str(series_ticker or "").upper()
+@@ -81,39 +147,142 @@ class MarketHarvester:
+         backoff += random.uniform(0.0, 0.5)
+         return backoff
+ 
+-    def _set_global_cooldown(self, seconds: float) -> None:
++    async def _set_global_cooldown(self, seconds: float) -> None:
+         now = time.time()
+         target = now + max(0.0, seconds)
+-        current = self.db.get_rate_limit_cooldown_until()
+-        if target > current:
+-            self.db.set_rate_limit_cooldown_until(target)
++        loop = asyncio.get_running_loop()
++
++        try:
++            if self._inflight is not None:
++                self._inflight.inflight_reads += 1
++            current = await loop.run_in_executor(
++                self._db_read_executor, self.db.get_rate_limit_cooldown_until
++            )
++            if self._inflight is not None:
++                self._inflight.inflight_reads = max(
++                    0, self._inflight.inflight_reads - 1
++                )
++        except Exception:
++            if self._inflight is not None:
++                self._inflight.inflight_reads = max(
++                    0, self._inflight.inflight_reads - 1
++                )
++            current = 0.0
++
++        if target <= float(current or 0.0):
++            return
++
++        try:
++            if self._inflight is not None:
++                self._inflight.inflight_writes += 1
++            await loop.run_in_executor(
++                self._db_write_executor, self.db.set_rate_limit_cooldown_until, target
++            )
++            if self._inflight is not None:
++                self._inflight.inflight_writes = max(
++                    0, self._inflight.inflight_writes - 1
++                )
++        except Exception as e:
++            if self._inflight is not None:
++                self._inflight.inflight_writes = max(
++                    0, self._inflight.inflight_writes - 1
++                )
++            if now - self._last_global_cooldown_log_ts >= 10.0:
++                self._last_global_cooldown_log_ts = now
++                self.logger.log_warn(
++                    f"[Harvester] Failed to write global cooldown: {e}"
++                )
+ 
+     async def _maybe_wait_for_global_cooldown(self) -> bool:
+         now = time.time()
+-        cooldown_until = self.db.get_rate_limit_cooldown_until()
++        loop = asyncio.get_running_loop()
++        try:
++            if self._inflight is not None:
++                self._inflight.inflight_reads += 1
++            cooldown_until = await loop.run_in_executor(
++                self._db_read_executor, self.db.get_rate_limit_cooldown_until
++            )
++            if self._inflight is not None:
++                self._inflight.inflight_reads = max(
++                    0, self._inflight.inflight_reads - 1
++                )
++        except Exception as e:
++            if self._inflight is not None:
++                self._inflight.inflight_reads = max(
++                    0, self._inflight.inflight_reads - 1
++                )
++            if now - self._last_global_cooldown_log_ts >= 10.0:
++                self._last_global_cooldown_log_ts = now
++                self.logger.log_warn(
++                    f"[Harvester] Failed to read global cooldown: {e}"
++                )
++            return False
+         if now < cooldown_until:
+             if now - self._last_global_cooldown_log_ts >= 10.0:
+                 self._last_global_cooldown_log_ts = now
+                 self.logger.log_warn(
+-                    f"[Harvester] Global cooldown active for {cooldown_until - now:.2f}s. Pausing discovery.")
++                    f"[Harvester] Global cooldown active for {cooldown_until - now:.2f}s. Pausing discovery."
++                )
+             await asyncio.sleep(min(1.0, cooldown_until - now))
+             return True
+         return False
+ 
+     async def _discovery_loop(self):
+         """The main execution cycle for the broad market scan."""
+-        self.logger.log_info("[Harvester] Starting Discovery Loop (60s)...")
++        self.logger.log_info(
++            f"[Harvester] Starting Discovery Loop (60s)... gen={self.generation}"
++        )
++
+         while True:
++            if not self._still_current():
++                self.logger.log_warn(
++                    f"[Harvester] Stale generation detected (gen={self.generation}). Exiting discovery loop."
++                )
++                return
++
++            self._cycle_id += 1
++            cycle_id = self._cycle_id
++            cycle_start = time.time()
++            self._last_metrics_write_ts = 0.0
++
++            self.logger.log_info(
++                f"[Harvester] Cycle {cycle_id} start (gen={self.generation})."
++            )
++
++            pages = 0
++            markets = 0
+             try:
+-                self.logger.log_info(
+-                    "[Harvester] Discovery: Starting full market scan.")
+-                await self._harvest_all_markets_paginated()
++                pages, markets = await self._harvest_all_markets_paginated(
++                    cycle_id=cycle_id,
++                    cycle_start_ts=cycle_start,
++                )
++            except asyncio.CancelledError:
++                self.logger.log_warn(
++                    f"[Harvester] Cycle {cycle_id} cancelled (gen={self.generation})."
++                )
++                raise
+             except Exception as e:
+-                self.logger.log_error(f"[Harvester] Discovery Loop Error: {e}")
++                self.logger.log_error(
++                    f"[Harvester] Cycle {cycle_id} error (gen={self.generation}): {e}"
++                )
++
++            duration = time.time() - cycle_start
++            if self._last_metrics_write_ts:
++                local = time.strftime(
++                    "%Y-%m-%d %H:%M:%S", time.localtime(self._last_metrics_write_ts)
++                )
++                last_write_str = f"{self._last_metrics_write_ts:.0f} ({local})"
++            else:
++                last_write_str = "n/a"
++
++            self.logger.log_info(
++                f"[Harvester] Cycle {cycle_id} complete (gen={self.generation}): "
++                f"pages={pages}, markets={markets}, duration_s={duration:.1f}, last_write_ts={last_write_str}"
++            )
+ 
+             await asyncio.sleep(60)
+ 
+-    async def _harvest_all_markets_paginated(self):
++    async def _harvest_all_markets_paginated(self, cycle_id: int, cycle_start_ts: float) -> Tuple[int, int]:
+         """Paginates through all open markets, saving metrics to market_metrics."""
+         cursor = None
+         loop = asyncio.get_running_loop()
+@@ -123,95 +292,198 @@ class MarketHarvester:
+         seen_tickers_this_cycle = set()
+ 
+         while True:
++            if not self._still_current():
++                self.logger.log_warn(
++                    f"[Harvester] Cycle {cycle_id} exiting (stale gen={self.generation})."
++                )
++                break
++
+             if await self._maybe_wait_for_global_cooldown():
+                 continue
++
+             try:
+-                response = await loop.run_in_executor(
+-                    None, lambda: self.market_api.get_markets(
+-                        limit=100, status="open", cursor=cursor)
++                fetch_fut = loop.run_in_executor(
++                    self._api_executor,
++                    lambda: self.market_api.get_markets_with_http_info(
++                        limit=100,
++                        status="open",
++                        cursor=cursor,
++                        _request_timeout=self._request_timeout,
++                    ).data,
+                 )
+-
+-                markets = getattr(response, 'markets', [])
+-                if not markets:
+-                    break
+-
+-                first_ticker = getattr(markets[0], 'ticker', None)
+-                if first_ticker and first_ticker in seen_tickers_this_cycle:
++                response = await asyncio.wait_for(fetch_fut, timeout=self._api_wait_timeout_s)
++                self._record_success()
++            except asyncio.TimeoutError:
++                self._record_timeout()
++                self.logger.log_warn(
++                    f"[Harvester] Cycle {cycle_id} get_markets timeout after {self._api_wait_timeout_s:.0f}s "
++                    f"(cursor={cursor}). Backing off."
++                )
++                await asyncio.sleep(self._timeout_backoff_s + random.uniform(0.0, 0.5))
++                continue
++            except urllib3.exceptions.TimeoutError as e:
++                self._record_timeout()
++                self.logger.log_warn(
++                    f"[Harvester] Cycle {cycle_id} get_markets HTTP timeout (cursor={cursor}): {e}. Backing off."
++                )
++                await asyncio.sleep(self._timeout_backoff_s + random.uniform(0.0, 0.5))
++                continue
++            except asyncio.CancelledError:
++                raise
++            except Exception as e:
++                status, retry_after = self._extract_status_and_retry_after(e)
++                if status == 429:
++                    cooldown = self._compute_429_cooldown(retry_after)
++                    await self._set_global_cooldown(cooldown)
+                     self.logger.log_warn(
+-                        f"[Harvester] Loop detected. Cycle complete at {total_found} markets.")
+-                    break
++                        f"[Harvester] Cycle {cycle_id} HTTP 429 (cursor={cursor}). Backing off for {cooldown:.2f}s."
++                    )
++                    continue
+ 
+-                for m in markets:
+-                    t = getattr(m, 'ticker', None)
+-                    if t:
+-                        seen_tickers_this_cycle.add(t)
++                self.logger.log_error(
++                    f"[Harvester] Cycle {cycle_id} pagination error (cursor={cursor}): {e}"
++                )
++                break
+ 
+-                await self._save_metrics_batch(markets)
++            markets = getattr(response, "markets", [])
++            if not markets:
++                break
+ 
+-                total_found += len(markets)
+-                page_count += 1
++            first_ticker = getattr(markets[0], "ticker", None)
++            if first_ticker and first_ticker in seen_tickers_this_cycle:
++                self.logger.log_warn(
++                    f"[Harvester] Cycle {cycle_id} loop detected. Ending scan at {total_found} markets."
++                )
++                break
+ 
+-                if page_count % 20 == 0:
+-                    self.logger.log_info(
+-                        f"[Harvester] Discovery: Scanned {total_found} markets across {page_count} pages.")
++            for m in markets:
++                t = getattr(m, "ticker", None)
++                if t:
++                    seen_tickers_this_cycle.add(t)
+ 
+-                next_cursor = getattr(response, 'cursor', None)
+-                if not next_cursor or next_cursor in seen_cursors:
+-                    break
+-                seen_cursors.add(next_cursor)
+-                cursor = next_cursor
++            try:
++                await self._save_metrics_batch(markets)
++            except asyncio.CancelledError:
++                raise
++            except Exception as e:
++                self.logger.log_error(
++                    f"[Harvester] Cycle {cycle_id} save_metrics failed (cursor={cursor}): {e}"
++                )
+ 
+-                await asyncio.sleep(random.uniform(0.05, 0.15))
++            total_found += len(markets)
++            page_count += 1
+ 
+-            except Exception as e:
+-                status, retry_after = self._extract_status_and_retry_after(e)
+-                if status == 429:
+-                    cooldown = self._compute_429_cooldown(retry_after)
+-                    self._set_global_cooldown(cooldown)
+-                    self.logger.log_warn(
+-                        f"[Harvester] Discovery HTTP 429. Backing off for {cooldown:.2f}s.")
+-                    continue
++            if page_count % self._page_log_every == 0:
++                elapsed = time.time() - cycle_start_ts
++                self.logger.log_info(
++                    f"[Harvester] Cycle {cycle_id} progress (gen={self.generation}): "
++                    f"pages={page_count}, markets={total_found}, elapsed_s={elapsed:.1f}"
++                )
+ 
+-                self.logger.log_error(f"[Harvester] Pagination break: {e}")
++            next_cursor = getattr(response, "cursor", None)
++            if not next_cursor or next_cursor in seen_cursors:
+                 break
++            seen_cursors.add(next_cursor)
++            cursor = next_cursor
++
++            await asyncio.sleep(random.uniform(0.05, 0.15))
++
++        return page_count, total_found
+ 
+     async def _save_metrics_batch(self, markets: List[Any]):
+         """Parses markets and saves to market_metrics + metadata."""
++        if not self._still_current():
++            self.logger.log_warn(
++                f"[Harvester] Skipping DB write (stale gen={self.generation})."
++            )
++            return
++
+         metrics_data, series_data, market_reg_data = [], [], []
+         now = time.time()
+ 
+         for m in markets:
+-            ticker = getattr(m, 'ticker', None)
++            ticker = getattr(m, "ticker", None)
+             if not ticker:
+                 continue
+ 
+-            s_ticker = getattr(m, 'series_ticker',
+-                               None) or ticker.split('-')[0]
++            s_ticker = getattr(m, "series_ticker", None) or ticker.split("-")[0]
+             cat = self._categorize(ticker, s_ticker)
+-            if cat == 'ESPORTS':
++            if cat == "ESPORTS":
+                 continue
+ 
+-            series_data.append((s_ticker, s_ticker, cat, 'unknown'))
++            series_data.append((s_ticker, s_ticker, cat, "unknown"))
+             market_reg_data.append(
+-                (ticker, s_ticker, getattr(m, 'expiration_time', '')))
++                (ticker, s_ticker, getattr(m, "expiration_time", ""))
++            )
+ 
+-            volume = getattr(m, 'volume', 0)
+-            open_interest = getattr(m, 'open_interest', 0)
+-            bid = getattr(m, 'yes_bid', 0)
+-            raw_ask = getattr(m, 'yes_ask', 100)
++            volume = getattr(m, "volume", 0)
++            open_interest = getattr(m, "open_interest", 0)
++            bid = getattr(m, "yes_bid", 0)
++            raw_ask = getattr(m, "yes_ask", 100)
+             ask = 100 if (raw_ask == 0 or raw_ask is None) else raw_ask
+             spread = ask - bid
+ 
+-            metrics_data.append((ticker, now, volume, open_interest, spread, bid, ask, 'active'))
++            metrics_data.append(
++                (ticker, now, volume, open_interest, spread, bid, ask, "active")
++            )
+ 
+         loop = asyncio.get_running_loop()
+-        await loop.run_in_executor(None, self.db.upsert_metadata, series_data, market_reg_data)
++
++        try:
++            if self._inflight is not None:
++                self._inflight.inflight_writes += 1
++            try:
++                ok_meta = await loop.run_in_executor(
++                    self._db_write_executor,
++                    self.db.upsert_metadata,
++                    series_data,
++                    market_reg_data,
++                )
++            finally:
++                if self._inflight is not None:
++                    self._inflight.inflight_writes = max(
++                        0, self._inflight.inflight_writes - 1
++                    )
++            if (series_data or market_reg_data) and not ok_meta:
++                self.logger.log_warn(
++                    f"[Harvester] Metadata upsert failed (db locked) gen={self.generation}."
++                )
++        except asyncio.CancelledError:
++            raise
++        except Exception as e:
++            self.logger.log_error(
++                f"[Harvester] Metadata upsert error (gen={self.generation}): {e}"
++            )
++
+         if metrics_data:
+-            await loop.run_in_executor(None, self.db.bulk_upsert_metrics, metrics_data)
++            try:
++                if self._inflight is not None:
++                    self._inflight.inflight_writes += 1
++                try:
++                    ok_metrics = await loop.run_in_executor(
++                        self._db_write_executor,
++                        self.db.bulk_upsert_metrics,
++                        metrics_data,
++                    )
++                finally:
++                    if self._inflight is not None:
++                        self._inflight.inflight_writes = max(
++                            0, self._inflight.inflight_writes - 1
++                        )
++                if ok_metrics:
++                    self._last_metrics_write_ts = now
++                else:
++                    self.logger.log_warn(
++                        f"[Harvester] Metrics upsert failed (db locked) gen={self.generation}."
++                    )
++            except asyncio.CancelledError:
++                raise
++            except Exception as e:
++                self.logger.log_error(
++                    f"[Harvester] Metrics upsert error (gen={self.generation}): {e}"
++                )
++
+ 
+     async def run_harvest_loop(self):
+-        """
+-        Entry point for the harvester service.
+-        Runs only the Discovery Loop.
+-        """
++        """Entry point for the harvester service."""
+         await self._discovery_loop()
+diff --git a/scripts/migrate_obi_db.py b/scripts/migrate_obi_db.py
+new file mode 100644
+index 0000000..8e611eb
+--- /dev/null
++++ b/scripts/migrate_obi_db.py
+@@ -0,0 +1,101 @@
++import argparse
++import os
++import sqlite3
++from pathlib import Path
++from typing import List, Tuple
++
++from services.db import DatabaseManager, DB_PATH, OBI_DB_PATH
++
++
++def _resolve(p: str) -> Path:
++    return Path(os.path.expanduser(p)).resolve(strict=False)
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser(
++        description="Create (or migrate) a dedicated OBI DB from the primary DB."
++    )
++    parser.add_argument(
++        "--source",
++        default=str(DB_PATH),
++        help="Primary DB path (default: PROJECT_K_DB_PATH / services.db:DB_PATH).",
++    )
++    parser.add_argument(
++        "--dest",
++        default=str(OBI_DB_PATH),
++        help="OBI DB path (default: PROJECT_K_OBI_DB_PATH / services.db:OBI_DB_PATH).",
++    )
++    parser.add_argument(
++        "--fresh",
++        action="store_true",
++        help="Create schema only; do not copy existing market_obi rows.",
++    )
++    parser.add_argument(
++        "--wipe",
++        action="store_true",
++        help="Delete the destination DB file first (use with care).",
++    )
++    args = parser.parse_args()
++
++    source_path = _resolve(args.source)
++    dest_path = _resolve(args.dest)
++
++    print(f"[migrate_obi_db] source={source_path}")
++    print(f"[migrate_obi_db] dest={dest_path}")
++
++    if source_path == dest_path:
++        print("[migrate_obi_db] source == dest; nothing to do.")
++        return 0
++
++    if args.wipe and dest_path.exists():
++        dest_path.unlink()
++        for sidecar in (f"{dest_path}-wal", f"{dest_path}-shm"):
++            try:
++                Path(sidecar).unlink()
++            except FileNotFoundError:
++                pass
++
++    dest_db = DatabaseManager(db_path=dest_path, schema="obi")
++    if args.fresh:
++        print("[migrate_obi_db] Created OBI schema (fresh).")
++        return 0
++
++    source_db = DatabaseManager(db_path=source_path, schema="primary")
++    try:
++        with source_db.get_connection(role="read") as conn:
++            rows = conn.execute(
++                "SELECT ticker, timestamp, bid_count, ask_count, best_bid, best_ask FROM market_obi"
++            ).fetchall()
++    except sqlite3.OperationalError as e:
++        print(f"[migrate_obi_db] Failed to read from source market_obi: {e!r}")
++        return 1
++
++    obi_rows: List[Tuple] = []
++    for row in rows:
++        obi_rows.append(
++            (
++                row["ticker"],
++                float(row["timestamp"]) if row["timestamp"] is not None else 0.0,
++                int(row["bid_count"] or 0),
++                int(row["ask_count"] or 0),
++                row["best_bid"],
++                row["best_ask"],
++            )
++        )
++
++    if not obi_rows:
++        print("[migrate_obi_db] Source market_obi is empty; destination schema is ready.")
++        return 0
++
++    ok = dest_db.bulk_upsert_obi(obi_rows)
++    if not ok:
++        print("[migrate_obi_db] Copy failed (DB locked/busy). Try again with writers stopped.")
++        return 2
++
++    print(f"[migrate_obi_db] Copied {len(obi_rows)} rows into dest market_obi.")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
++
+diff --git a/run_supervised.sh b/run_supervised.sh
+new file mode 100755
+index 0000000..c80b6ad
+--- /dev/null
++++ b/run_supervised.sh
+@@ -0,0 +1,30 @@
++#!/usr/bin/env bash
++set -uo pipefail
++
++# Simple supervisor loop for running Discovery indefinitely.
++# Activate your environment (e.g., conda env) before running this script.
++
++cd "$(dirname "$0")"
++
++# ---- Canonical storage layout (override via env) ----
++export PROJECT_K_ROOT="${PROJECT_K_ROOT:-$HOME/ev/Project_K}"
++export PROJECT_K_DB_PATH="${PROJECT_K_DB_PATH:-$PROJECT_K_ROOT/data/kalshi.db}"
++# Optional: set this to a different file (e.g., $PROJECT_K_ROOT/data/obi.db) to reduce writer contention.
++export PROJECT_K_OBI_DB_PATH="${PROJECT_K_OBI_DB_PATH:-$PROJECT_K_DB_PATH}"
++export PROJECT_K_TRAINING_DIR="${PROJECT_K_TRAINING_DIR:-/Volumes/external/ev/Project_K/data/training}"
++export PROJECT_K_DB_READ_WORKERS="${PROJECT_K_DB_READ_WORKERS:-4}"
++
++while true; do
++  echo "[run_supervised] starting: $(date)  pwd=$(pwd)"
++  python main.py
++  code=$?
++
++  if [ "${code}" -eq 2 ]; then
++    echo "[run_supervised] main.py exited with code=2 (watchdog). restarting in 2s... $(date)"
++    sleep 2
++    continue
++  fi
++
++  echo "[run_supervised] main.py exited with code=${code}. exiting. $(date)"
++  exit "${code}"
++done
+diff --git a/.env.example b/.env.example
+new file mode 100644
+index 0000000..b572eab
+--- /dev/null
++++ b/.env.example
+@@ -0,0 +1,34 @@
++# ---- Kalshi Settings (fill these in) ----
++KALSHI_EMAIL="your-email@example.com"
++KALSHI_ENV="PROD"  # or "DEMO"
++
++# RSA Credentials
++KALSHI_API_KEY_ID="00000000-0000-0000-0000-000000000000"
++
++# Prefer repo-relative key paths for portability (resolved relative to PROJECT_K_ROOT or the repo).
++KALSHI_PRIVATE_KEY_PATH="key.key"
++
++# ---- Paths (override defaults if needed) ----
++# Live SQLite DB should stay on internal disk (APFS) for reliable WAL writes.
++PROJECT_K_DB_PATH="~/ev/Project_K/data/kalshi.db"
++
++# Optional (recommended): split OBI writes into a separate DB file to reduce cross-process writer contention.
++# If unset, defaults to PROJECT_K_DB_PATH for backward compatibility.
++# PROJECT_K_OBI_DB_PATH="~/ev/Project_K/data/obi.db"
++
++# Training parquet output can live on the external volume.
++PROJECT_K_TRAINING_DIR="/Volumes/external/ev/Project_K/data/training"
++
++# DB read executor worker threads (main.py). Writes/health are single-threaded.
++PROJECT_K_DB_READ_WORKERS=4
++
++# Optional: override repo root used for resolving relative paths (key path, etc).
++# PROJECT_K_ROOT="~/ev/Project_K"
++
++# ---- Safety Flags ----
++# Refuse to use a DB under /Volumes unless explicitly allowed.
++ALLOW_EXTERNAL_DB=0
++
++# If the external volume is not mounted, fail fast by default.
++# Set to 1 to fall back to ~/ev/Project_K/data/training_staging.
++TRAINING_FALLBACK_LOCAL=0
+diff --git a/README.md b/README.md
+new file mode 100644
+index 0000000..65caddf
+--- /dev/null
++++ b/README.md
+@@ -0,0 +1,146 @@
++# Project_K Runbook (DB Local, Training External)
++
++This repo is set up for reliable live SQLite writes on the internal SSD while keeping large training output on an external volume.
++
++## Canonical Paths
++
++- Repo root (recommended): `~/ev/Project_K`
++- SQLite DB (WAL, hot writes): `~/ev/Project_K/data/kalshi.db`
++- OBI DB (optional, recommended): `~/ev/Project_K/data/obi.db`
++- Training dataset output (parquet): `/Volumes/external/ev/Project_K/data/training`
++
++These paths are centralized in `services/db.py` and can be overridden via environment variables.
++
++## Migration Notes (Idempotent)
++
++1) Stop all writers (Discovery + OBI tracker) so there are no open SQLite handles.
++
++2) If you are copying a WAL-mode DB from another location, checkpoint first:
++
++```bash
++sqlite3 /path/to/source/kalshi.db "pragma wal_checkpoint(truncate);"
++```
++
++3) Copy the DB and sidecars together:
++
++- `kalshi.db`
++- `kalshi.db-wal`
++- `kalshi.db-shm`
++
++into `~/ev/Project_K/data/`.
++
++Re-running these steps is safe as long as processes are stopped during the copy.
++
++## Environment Variables
++
++- `PROJECT_K_DB_PATH` (default: `~/ev/Project_K/data/kalshi.db`)
++- `PROJECT_K_OBI_DB_PATH` (default: `PROJECT_K_DB_PATH`; recommended: `~/ev/Project_K/data/obi.db`)
++- `PROJECT_K_TRAINING_DIR` (default: `/Volumes/external/ev/Project_K/data/training`)
++- `PROJECT_K_DB_READ_WORKERS` (default: `4`)
++- `PROJECT_K_ROOT` (optional; used for resolving relative key paths)
++
++Safety flags:
++
++- `ALLOW_EXTERNAL_DB=1` to allow a DB path under `/Volumes/...` (default: refuse)
++- `TRAINING_FALLBACK_LOCAL=1` to write to `~/ev/Project_K/data/training_staging` if the external volume is not mounted (default: fail fast)
++
++## Start (Two Terminals)
++
++Terminal A (Discovery):
++
++```bash
++cd ~/ev/Project_K
++export PROJECT_K_DB_PATH=~/ev/Project_K/data/kalshi.db
++# Recommended to reduce cross-process writer contention:
++export PROJECT_K_OBI_DB_PATH=~/ev/Project_K/data/obi.db
++export PROJECT_K_TRAINING_DIR=/Volumes/external/ev/Project_K/data/training
++export PROJECT_K_DB_READ_WORKERS=4
++python main.py
++```
++
++Terminal B (OBI tracker):
++
++```bash
++cd ~/ev/Project_K
++export PROJECT_K_DB_PATH=~/ev/Project_K/data/kalshi.db
++export PROJECT_K_OBI_DB_PATH=~/ev/Project_K/data/obi.db
++export PROJECT_K_TRAINING_DIR=/Volumes/external/ev/Project_K/data/training
++python -m scripts.obi_tracker
++```
++
++At startup, both processes log PIDs and DB paths. If you split OBI, `db_primary=...` and `db_obi=...` should differ.
++
++If you are enabling an OBI DB split on an existing primary DB, migrate existing OBI rows once (optional):
++
++```bash
++python -m scripts.migrate_obi_db --source "$PROJECT_K_DB_PATH" --dest "$PROJECT_K_OBI_DB_PATH"
++```
++
++## Supervisor (Optional)
++
++`run_supervised.sh` exports the canonical path env vars and restarts `main.py` only when it exits with code `2` (watchdog).
++
++```bash
++./run_supervised.sh
++```
++
++## Verify DB Is Local + WAL
++
++```bash
++sqlite3 "$PROJECT_K_DB_PATH" "pragma journal_mode; pragma busy_timeout;"
++```
++
++Expected:
++
++- `wal`
++- `busy_timeout` is non-zero
++
++Tables:
++
++```bash
++sqlite3 "$PROJECT_K_DB_PATH" ".tables"
++```
++
++Expected to include at least: `market_metrics`, `market_obi`
++
++## Verify Freshness While Running
++
++```bash
++sqlite3 "$PROJECT_K_DB_PATH" "select datetime(max(timestamp),'unixepoch','localtime'), (strftime('%s','now')-max(timestamp)) as stale_s from market_metrics;"
++sqlite3 "$PROJECT_K_OBI_DB_PATH" "select count(*) from market_obi;"
++```
++
++- `stale_s` should stay reasonably low during active runs (typically < 60-120s).
++- `market_obi` count should be non-zero and generally increasing/stable while `scripts.obi_tracker` runs.
++
++## Verify Training Writes Go To External
++
++```bash
++ls -la /Volumes/external/ev/Project_K/data/training | head
++```
++
++New partitions should appear under the external training directory when Discovery is running (parquet output is partitioned by date/category).
++
++## Soak Test (60+ Minutes)
++
++1) Run `python main.py` and `python -m scripts.obi_tracker` together for 60+ minutes.
++
++2) While running, periodically check:
++
++```bash
++sqlite3 "$PROJECT_K_DB_PATH" "select (strftime('%s','now')-max(timestamp)) as stale_s from market_metrics;"
++sqlite3 "$PROJECT_K_OBI_DB_PATH" "select count(*) from market_obi;"
++```
++
++3) Expected:
++
++- Heartbeat continues to log non-zero `max_ts` and reasonable `stale_s`.
++- If DB health checks fail repeatedly, the DB circuit breaker restarts the harvester and (if still unhealthy for >10 minutes after reinit attempts) exits with code `2` for supervisor restart.
++
++## Debugging “Alive But Stalled” (Stack Dump)
++
++`main.py` installs a SIGUSR1 handler that dumps stack traces for all threads. While the process is running:
++
++```bash
++kill -USR1 <pid>
++```

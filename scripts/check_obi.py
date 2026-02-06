@@ -1,12 +1,12 @@
 import argparse
 import time
 import pandas as pd
-from services.db import DatabaseManager, DB_PATH
+from services.db import DatabaseManager, OBI_DB_PATH
 
 
 def check_obi_data(show_count: bool = False):
-    db = DatabaseManager()
-    print(f"[check_obi] Using DB: {DB_PATH}")
+    db = DatabaseManager(db_path=OBI_DB_PATH, schema="obi")
+    print(f"[check_obi] Using OBI DB: {OBI_DB_PATH}")
 
     # Query to see the latest OBI captures
     query = """
@@ -23,7 +23,7 @@ def check_obi_data(show_count: bool = False):
     """
 
     try:
-        with db.get_connection() as conn:
+        with db.get_connection(role="read") as conn:
             df = pd.read_sql_query(query, conn)
 
         if df.empty:
@@ -44,7 +44,7 @@ def check_obi_data(show_count: bool = False):
     if show_count:
         try:
             now = time.time()
-            with db.get_connection() as conn:
+            with db.get_connection(role="read") as conn:
                 total = conn.execute(
                     "SELECT COUNT(*) as total FROM market_obi"
                 ).fetchone()["total"]
