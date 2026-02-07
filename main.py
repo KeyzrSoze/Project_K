@@ -162,6 +162,10 @@ async def amain():
         feature_extractor = FeatureExtractor()
         executor: Optional[OrderExecutor] = None
 
+        # Toggle trade execution without changing data collection.
+        # 1 = enabled (default), 0 = disabled.
+        TRADING_ENABLED: bool = os.getenv('PROJECT_K_TRADING_ENABLED', '1') == '1'
+
         tickers: List[str] = []
         last_ticker_refresh_time: float = 0.0
         TICKER_REFRESH_INTERVAL: float = 60.0
@@ -646,12 +650,13 @@ async def amain():
                                     logger.log_info(
                                         f"STRATEGY SIGNAL for {ticker}: {signal_out}"
                                     )
-                                    await executor.place_limit_order(
-                                        ticker=ticker,
-                                        side=signal_out["side"],
-                                        count=1,
-                                        price=signal_out["price"],
-                                    )
+                                    if TRADING_ENABLED:
+                                        await executor.place_limit_order(
+                                            ticker=ticker,
+                                            side=signal_out["side"],
+                                            count=1,
+                                            price=signal_out["price"],
+                                        )
                             except Exception as e:
                                 logger.log_error(
                                     f"Error during strategy/execution for {ticker}: {e}"

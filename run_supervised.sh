@@ -6,6 +6,14 @@ set -uo pipefail
 
 cd "$(dirname "$0")"
 
+# Load environment variables from .env if present.
+# This enables toggles like PROJECT_K_TRADING_ENABLED without manual export.
+if [ -f .env ]; then
+  set -a
+  source .env
+  set +a
+fi
+
 # ---- Canonical storage layout (override via env) ----
 export PROJECT_K_ROOT="${PROJECT_K_ROOT:-$HOME/ev/Project_K}"
 export PROJECT_K_DB_PATH="${PROJECT_K_DB_PATH:-$PROJECT_K_ROOT/data/kalshi.db}"
