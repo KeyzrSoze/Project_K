@@ -1,0 +1,10 @@
+{
+  "n_eval_rows": 101.0,
+  "policy_long_coverage": 0.1188118811881188,
+  "policy_long_win_rate_strict": 0.0,
+  "policy_short_coverage": 0.13861386138613863,
+  "policy_short_win_rate_strict": 0.0,
+  "test_dir_acc": 0.039603960396039604,
+  "test_mae_mid_h_end": 2.09078316405268,
+  "test_rmse_mid_h_end": 7.53959999479434
+}

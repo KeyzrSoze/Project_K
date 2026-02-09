@@ -1,0 +1,30 @@
+{
+  "bar_spec": {
+    "encoder_length": 120,
+    "freq": "30s",
+    "horizon_steps": 20,
+    "max_gap": "2h"
+  },
+  "tft_spec": {
+    "attention_head_size": 4,
+    "batch_size": 256,
+    "dropout": 0.1,
+    "encoder_length": 120,
+    "freq": "30s",
+    "hidden_continuous_size": 16,
+    "hidden_size": 32,
+    "horizon_steps": 20,
+    "learning_rate": 0.001,
+    "max_epochs": 3,
+    "max_gap": "2h",
+    "min_bars_per_segment": 150,
+    "num_workers": 0,
+    "quantiles": [
+      0.1,
+      0.5,
+      0.9
+    ],
+    "test_days": 1,
+    "val_days": 1
+  }
+}

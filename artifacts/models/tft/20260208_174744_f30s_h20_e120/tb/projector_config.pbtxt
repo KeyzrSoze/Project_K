@@ -1,0 +1,15 @@
+embeddings {
+  tensor_name: "ticker:01981"
+  metadata_path: "01981/ticker/metadata.tsv"
+  tensor_path: "01981/ticker/tensors.tsv"
+}
+embeddings {
+  tensor_name: "category:01981"
+  metadata_path: "01981/category/metadata.tsv"
+  tensor_path: "01981/category/tensors.tsv"
+}
+embeddings {
+  tensor_name: "series_ticker:01981"
+  metadata_path: "01981/series_ticker/metadata.tsv"
+  tensor_path: "01981/series_ticker/tensors.tsv"
+}

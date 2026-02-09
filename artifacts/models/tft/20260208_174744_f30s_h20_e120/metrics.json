@@ -1,0 +1,53 @@
+{
+  "alignment_shift_diagnostics": [
+    {
+      "dir_acc": NaN,
+      "mae_mid_h_end": NaN,
+      "n_rows": 0,
+      "rmse_mid_h_end": NaN,
+      "shift": -2
+    },
+    {
+      "dir_acc": NaN,
+      "mae_mid_h_end": NaN,
+      "n_rows": 0,
+      "rmse_mid_h_end": NaN,
+      "shift": -1
+    },
+    {
+      "dir_acc": 0.05763688760806916,
+      "mae_mid_h_end": 22.861929854673335,
+      "n_rows": 1388,
+      "rmse_mid_h_end": 26.40913202564511,
+      "shift": 0
+    },
+    {
+      "dir_acc": NaN,
+      "mae_mid_h_end": NaN,
+      "n_rows": 0,
+      "rmse_mid_h_end": NaN,
+      "shift": 1
+    },
+    {
+      "dir_acc": NaN,
+      "mae_mid_h_end": NaN,
+      "n_rows": 0,
+      "rmse_mid_h_end": NaN,
+      "shift": 2
+    }
+  ],
+  "baseline_dir_acc": 0.9142651296829971,
+  "baseline_mae_mid_h_end": 1.7878242074927955,
+  "baseline_n_eval_rows": 1388,
+  "baseline_rmse_mid_h_end": 8.830812492604455,
+  "eval_join_key": "decision_time_idx",
+  "eval_n_rows_after_join": 1388,
+  "n_eval_rows": 1388.0,
+  "policy_long_coverage": 0.5561959654178674,
+  "policy_long_win_rate_strict": 0.0,
+  "policy_short_coverage": 0.05403458213256484,
+  "policy_short_win_rate_strict": 0.09333333333333334,
+  "test_dir_acc": 0.05763688760806916,
+  "test_mae_mid_h_end": 22.861929854673335,
+  "test_rmse_mid_h_end": 26.40913202564511
+}

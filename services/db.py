@@ -503,9 +503,28 @@ class DatabaseManager:
 
     def get_market_snapshot(self, ticker: str):
         """Retrieves the latest snapshot for a ticker from the broad metrics table."""
+        query = """
+            SELECT
+                m.id,
+                m.ticker,
+                m.timestamp,
+                m.volume,
+                m.open_interest,
+                m.spread,
+                m.best_bid,
+                m.best_ask,
+                COALESCE(m.status, 'unknown')             AS status,
+                COALESCE(mr.series_ticker, 'unknown')     AS series_ticker,
+                COALESCE(sr.category, 'MISC')             AS category
+            FROM market_metrics m
+            LEFT JOIN market_registry mr
+                ON mr.ticker = m.ticker
+            LEFT JOIN series_registry sr
+                ON sr.series_ticker = mr.series_ticker
+            WHERE m.ticker = ?
+        """
         with self.get_connection(role="read") as conn:
-            row = conn.execute(
-                "SELECT * FROM market_metrics WHERE ticker = ?", (ticker,)).fetchone()
+            row = conn.execute(query, (ticker,)).fetchone()
             return dict(row) if row else None
 
     def get_market_obi(self, ticker: str):
@@ -525,12 +544,17 @@ class DatabaseManager:
                 m.volume,
                 m.open_interest,
                 m.spread,
+                COALESCE(m.status, 'unknown') as status,
+                COALESCE(mr.series_ticker, 'unknown') as series_ticker,
+                COALESCE(sr.category, 'MISC') as category,
                 COALESCE(o.bid_count, 0) as bid_count,
                 COALESCE(o.ask_count, 0) as ask_count,
                 COALESCE(o.best_bid, m.best_bid) as best_bid,
                 COALESCE(o.best_ask, m.best_ask) as best_ask
             FROM market_metrics m
             LEFT JOIN market_obi o ON o.ticker = m.ticker
+            LEFT JOIN market_registry mr ON mr.ticker = m.ticker
+            LEFT JOIN series_registry sr ON sr.series_ticker = mr.series_ticker
             WHERE m.ticker = ?
         """
         with self.get_connection(role="read") as conn:

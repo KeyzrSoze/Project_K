@@ -1,0 +1,9 @@
+Policy run artifacts
+- min_edge: 1.0
+- max_spread: 5.0
+- max_staleness_sec: 60.0
+- require_has_obs: True
+- enforce_group_cooldown: True
+- group_key: series_ticker
+- horizon_steps: 20
+- freq: 30s

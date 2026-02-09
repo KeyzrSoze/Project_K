@@ -95,7 +95,21 @@ class MarketHarvester:
         s = str(series_ticker or "").upper()
         if "ESPORTS" in t or "ESPORTS" in s:
             return "ESPORTS"
-        if s.startswith("KX") and any(coin in s for coin in ["BTC", "ETH", "SOL", "DOGE", "BITCOIN"]):
+        if any(k in s for k in ["NCAAMB", "NCAA"]):
+            return "SPORTS_NCAA"
+        if "NBA" in s:
+            return "SPORTS_NBA"
+        if "NFL" in s:
+            return "SPORTS_NFL"
+        if "NHL" in s:
+            return "SPORTS_NHL"
+        if "MLB" in s:
+            return "SPORTS_MLB"
+        if any(k in s for k in ["SOCCER", "EPL", "MLS", "UEFA", "UCL", "FIFA", "WORLD_CUP", "WORLD CUP"]):
+            return "SPORTS_SOCCER"
+        if any(coin in s for coin in ["BTC", "ETH", "SOL", "DOGE", "BITCOIN", "CRYPTO"]) or any(
+            coin in t for coin in ["BTC", "ETH", "SOL", "DOGE", "BITCOIN", "CRYPTO"]
+        ):
             return "CRYPTO"
         if any(k in s for k in ["FED", "INFL", "CPI", "GDP", "RATE", "FOMC", "UNEMPLOYMENT"]):
             return "ECON"
