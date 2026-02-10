@@ -11,56 +11,12 @@ from typing import Dict, Iterator, List, Sequence, Tuple, Callable, Optional
 
 from utils.logger import logger
 
+from services.paths import REPO_ROOT, DATA_DIR, DB_PATH, OBI_DB_PATH, TRAINING_DIR
+
 def _env_flag(name: str) -> bool:
     value = (os.getenv(name) or "").strip().lower()
     return value in ("1", "true", "yes", "y", "on")
 
-
-def _resolve_path(value: str, *, base: Optional[Path] = None) -> Path:
-    p = Path(os.path.expanduser(value))
-    if not p.is_absolute():
-        p = (base or Path.cwd()) / p
-    return p.resolve(strict=False)
-
-
-def _default_repo_root() -> Path:
-    # Canonical "production" location (internal SSD / APFS).
-    return (Path.home() / "ev" / "Project_K").resolve(strict=False)
-
-
-def resolve_repo_root() -> Path:
-    env_root = os.getenv("PROJECT_K_ROOT")
-    if env_root:
-        return _resolve_path(env_root)
-    return _default_repo_root()
-
-
-REPO_ROOT = resolve_repo_root()
-
-ENV_DATA_DIR = os.getenv("PROJECT_K_DATA_DIR")
-if ENV_DATA_DIR:
-    DATA_DIR = _resolve_path(ENV_DATA_DIR, base=REPO_ROOT)
-else:
-    DATA_DIR = (REPO_ROOT / "data").resolve(strict=False)
-
-ENV_DB_PATH = os.getenv("PROJECT_K_DB_PATH")
-if ENV_DB_PATH:
-    DB_PATH = _resolve_path(ENV_DB_PATH, base=REPO_ROOT)
-else:
-    DB_PATH = (DATA_DIR / "kalshi.db").resolve(strict=False)
-
-ENV_OBI_DB_PATH = os.getenv("PROJECT_K_OBI_DB_PATH")
-if ENV_OBI_DB_PATH:
-    OBI_DB_PATH = _resolve_path(ENV_OBI_DB_PATH, base=REPO_ROOT)
-else:
-    OBI_DB_PATH = DB_PATH
-
-ENV_TRAINING_DIR = os.getenv("PROJECT_K_TRAINING_DIR")
-if ENV_TRAINING_DIR:
-    TRAINING_DIR = _resolve_path(ENV_TRAINING_DIR, base=REPO_ROOT)
-else:
-    # Large append-only parquet output goes on the external volume by default.
-    TRAINING_DIR = Path("/Volumes/external/ev/Project_K/data/training").resolve(strict=False)
 
 ALLOW_EXTERNAL_DB = _env_flag("ALLOW_EXTERNAL_DB")
 TRAINING_FALLBACK_LOCAL = _env_flag("TRAINING_FALLBACK_LOCAL")
@@ -100,46 +56,61 @@ def validate_db_path_or_raise(db_path: Path, *, label: str) -> None:
         logger.log_error(f"[DB] Refusing to use {label} under /Volumes: {db_path}")
         raise RuntimeError(
             f"Refusing to use {label} under /Volumes: {db_path}. "
-            "Move the SQLite DB to local disk (e.g., ~/ev/Project_K/data/kalshi.db) "
+            "Move the SQLite DB to local disk (e.g., <repo>/data/kalshi.db) "
             "or set ALLOW_EXTERNAL_DB=1 to override."
         )
 
 
-def ensure_training_dir() -> Path:
-    training_dir = Path(TRAINING_DIR)
-    external_root = Path("/Volumes/external")
+def _macos_volume_root(path: Path) -> Optional[Path]:
+    """If `path` is under /Volumes/<name>/..., return that mount root; else None."""
+    parts = path.parts
+    if len(parts) >= 3 and parts[0] == "/" and parts[1] == "Volumes":
+        return Path("/Volumes") / parts[2]
+    return None
 
-    if _is_under(training_dir, external_root) and not external_root.exists():
+
+def ensure_training_dir() -> Path:
+    """Return a writable training dataset directory.
+
+    Default TRAINING_DIR is repo-relative (<repo>/data/training). On hosts with an
+    external drive, that folder can be a symlink to the drive.
+
+    If the resolved path lives under a macOS volume that is not mounted and
+    TRAINING_FALLBACK_LOCAL=1, we fall back to <repo>/data/training_staging.
+    """
+    configured = Path(TRAINING_DIR).expanduser()
+    resolved = configured.resolve(strict=False)
+
+    vol_root = _macos_volume_root(resolved)
+    if vol_root is not None and not vol_root.exists():
         if TRAINING_FALLBACK_LOCAL:
             fallback = (REPO_ROOT / "data" / "training_staging").resolve(strict=False)
             fallback.mkdir(parents=True, exist_ok=True)
             logger.log_warn(
-                f"[Training] External volume not mounted. Falling back to local staging: {fallback} "
+                f"[Training] Volume not mounted ({vol_root}). Falling back to local staging: {fallback} "
                 "(set TRAINING_FALLBACK_LOCAL=0 to fail fast)."
             )
             return fallback
         raise RuntimeError(
-            "Training directory is on /Volumes/external but the volume is not mounted. "
-            "Mount /Volumes/external or set TRAINING_FALLBACK_LOCAL=1 to write to "
-            "~/ev/Project_K/data/training_staging."
+            f"Training directory resolves under {vol_root} but the volume is not mounted. "
+            "Mount the volume or set TRAINING_FALLBACK_LOCAL=1 to write to "
+            f"{(REPO_ROOT / 'data' / 'training_staging').resolve(strict=False)}."
         )
 
     try:
-        training_dir.mkdir(parents=True, exist_ok=True)
+        resolved.mkdir(parents=True, exist_ok=True)
     except Exception as e:
         if TRAINING_FALLBACK_LOCAL:
             fallback = (REPO_ROOT / "data" / "training_staging").resolve(strict=False)
             fallback.mkdir(parents=True, exist_ok=True)
             logger.log_warn(
-                f"[Training] Failed to create training dir ({training_dir}): {e}. "
+                f"[Training] Failed to create training dir ({resolved}): {e}. "
                 f"Falling back to local staging: {fallback}"
             )
             return fallback
-        raise RuntimeError(
-            f"Failed to create training directory: {training_dir}: {e}"
-        ) from e
+        raise RuntimeError(f"Failed to create training directory: {resolved}: {e}") from e
 
-    return training_dir
+    return resolved
 
 
 # Validate configuration at import time so all entrypoints agree early.

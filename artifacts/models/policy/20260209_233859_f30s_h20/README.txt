@@ -1,0 +1,13 @@
+Policy run artifacts
+- min_edge: 0.0
+- group_key_mode: event3
+- selection_mode: topk
+- topk_per_day: 20
+- fee_per_trade: 2.0
+- max_spread: 5.0
+- max_staleness_sec: 60.0
+- require_has_obs: True
+- enforce_group_cooldown: True
+- group_key: group_key
+- horizon_steps: 20
+- freq: 30s

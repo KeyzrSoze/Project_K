@@ -1,4 +1,3 @@
-\
 """
 Train a Temporal Fusion Transformer (TFT) on Project_K's partitioned parquet dataset.
 
@@ -20,12 +19,14 @@ import argparse
 from datetime import datetime
 from pathlib import Path
 
+from services.paths import ARTIFACTS_DIR
+
 from services.ml.data import load_training_parquet, validate_schema, BarSpec, build_bars
 from services.ml.tft import TFTSpec, make_datasets, train_tft, save_run_artifacts
 
 
 def _default_run_root() -> Path:
-    return (Path.home() / "ev" / "Project_K" / "artifacts" / "models" / "tft").expanduser()
+    return (ARTIFACTS_DIR / "models" / "tft").resolve(strict=False)
 
 
 def main() -> int:

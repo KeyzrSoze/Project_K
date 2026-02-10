@@ -1,4 +1,3 @@
-\
 """
 Run TFT inference on the latest bars (live-style) and print top predicted movers.
 
@@ -12,7 +11,7 @@ This script:
 
 Example:
   python -m scripts.infer_tft \
-    --run-dir ~/ev/Project_K/artifacts/models/tft/<run_id> \
+    --run-dir "$PROJECT_K_ROOT/artifacts/models/tft/<run_id>" \
     --training-dir "$PROJECT_K_TRAINING_DIR" \
     --top 25
 """

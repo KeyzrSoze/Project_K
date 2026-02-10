@@ -8,6 +8,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import List
 
+from services.paths import ARTIFACTS_DIR
+
 import pandas as pd
 from rich.console import Console
 from rich.table import Table
@@ -24,7 +26,7 @@ from services.ml.policy import (
 
 
 def _default_run_root() -> Path:
-    return (Path.home() / "ev" / "Project_K" / "artifacts" / "models" / "policy").expanduser()
+    return (ARTIFACTS_DIR / "models" / "policy").resolve(strict=False)
 
 
 def _tail_last_day(df: pd.DataFrame) -> pd.DataFrame:

@@ -4,7 +4,8 @@ set -uo pipefail
 # Simple supervisor loop for running Discovery indefinitely.
 # Activate your environment (e.g., conda env) before running this script.
 
-cd "$(dirname "$0")"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
 
 # Load environment variables from .env if present.
 # This enables toggles like PROJECT_K_TRADING_ENABLED without manual export.
@@ -15,11 +16,13 @@ if [ -f .env ]; then
 fi
 
 # ---- Canonical storage layout (override via env) ----
-export PROJECT_K_ROOT="${PROJECT_K_ROOT:-$HOME/ev/Project_K}"
+# Defaults are repo-relative for portability.
+export PROJECT_K_ROOT="${PROJECT_K_ROOT:-$SCRIPT_DIR}"
 export PROJECT_K_DB_PATH="${PROJECT_K_DB_PATH:-$PROJECT_K_ROOT/data/kalshi.db}"
 # Optional: set this to a different file (e.g., $PROJECT_K_ROOT/data/obi.db) to reduce writer contention.
 export PROJECT_K_OBI_DB_PATH="${PROJECT_K_OBI_DB_PATH:-$PROJECT_K_DB_PATH}"
-export PROJECT_K_TRAINING_DIR="${PROJECT_K_TRAINING_DIR:-/Volumes/external/ev/Project_K/data/training}"
+# Default training output is repo-relative; make $PROJECT_K_ROOT/data/training a symlink to your external drive.
+export PROJECT_K_TRAINING_DIR="${PROJECT_K_TRAINING_DIR:-$PROJECT_K_ROOT/data/training}"
 export PROJECT_K_DB_READ_WORKERS="${PROJECT_K_DB_READ_WORKERS:-4}"
 
 while true; do
