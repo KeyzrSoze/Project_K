@@ -4,6 +4,7 @@
 
 # Ignore all Parquet data files
 *.parquet
+data/*
 data/training/
 data/recordings/
 

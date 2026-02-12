@@ -158,7 +158,14 @@ def main() -> int:
     split_metrics: dict[str, dict] = {}
 
     for split_name, split_df in split_inputs.items():
-        trade_log, metrics = backtest_policy(split_df, models, feature_cols, spec=spec)
+        trade_log, metrics = backtest_policy(
+            split_df,
+            models,
+            feature_cols,
+            spec=spec,
+            split_name=split_name,
+            run_dir=run_dir,
+        )
         trade_logs[split_name] = trade_log
         split_metrics[split_name] = metrics
 
