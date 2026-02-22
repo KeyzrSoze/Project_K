@@ -1,0 +1,26 @@
+# Ignore all database files
+*.db
+*.sqlite
+*-wal
+*-shm
+
+# Ignore all Parquet data files
+*.parquet
+data/*
+data/training/*
+data/recordings/*
+data/
+
+.env
+.env.*
+..env.old-info
+
+artifacts/
+**/*.joblib
+**/*.pkl
+lightning_logs/
+**/__pycache__/
+*.pyc
+
+key.key
+demo-key.key

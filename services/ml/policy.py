@@ -289,6 +289,30 @@ def is_tradable(
     return (spread_v <= float(max_spread)) and (staleness_v <= float(max_staleness_sec))
 
 
+def _row_tradable_with_thresholds(
+    *,
+    bid: float | int | None,
+    ask: float | int | None,
+    spread: float | int | None,
+    staleness_sec: float | int | None,
+    has_obs: float | int | None,
+    max_spread: float,
+    max_staleness_sec: float,
+    require_has_obs: bool = True,
+) -> bool:
+    # Keep rule parity with entry screening (tradable_mask/is_tradable): spread + staleness + has_obs.
+    _ = bid
+    _ = ask
+    return is_tradable(
+        spread=spread,
+        staleness_sec=staleness_sec,
+        has_obs=has_obs,
+        max_spread=max_spread,
+        max_staleness_sec=max_staleness_sec,
+        require_has_obs=require_has_obs,
+    )
+
+
 def _apply_fee_per_trade(gross_pnl: pd.Series, fee_per_trade: float) -> pd.Series:
     return gross_pnl.astype("float64") - float(fee_per_trade)
 
@@ -550,6 +574,243 @@ def _trade_metrics(
     }
 
 
+def _trade_log_columns(group_col: str) -> List[str]:
+    return [
+        "timestamp",
+        "ticker",
+        group_col,
+        "series_id",
+        "time_idx",
+        "side",
+        "pred_long",
+        "pred_short",
+        "pred_edge",
+        "realized_pnl",
+        "realized_pnl_gross",
+        "realized_pnl_net",
+        "pnl_conservative_gross",
+        "pnl_conservative_net",
+        "spread",
+        "staleness_sec",
+        "has_obs",
+        "entry_timestamp",
+        "entry_time_idx",
+        "entry_bid",
+        "entry_ask",
+        "entry_mid",
+        "entry_spread",
+        "entry_staleness_sec",
+        "entry_has_obs",
+        "entry_price_used",
+        "exit_timestamp",
+        "exit_time_idx",
+        "exit_bid",
+        "exit_ask",
+        "exit_mid",
+        "exit_spread",
+        "exit_staleness_sec",
+        "exit_has_obs",
+        "exit_price_used",
+        "horizon_dt_sec",
+        "exit_tradable",
+    ]
+
+
+def make_trade_log_row(row: pd.Series, *, group_col: str) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for column in _trade_log_columns(group_col):
+        out[column] = row.get(column, np.nan)
+    return out
+
+
+def _build_trade_log_frame(trades: pd.DataFrame, *, group_col: str) -> pd.DataFrame:
+    columns = _trade_log_columns(group_col)
+    if trades.empty:
+        return pd.DataFrame(columns=columns)
+
+    rows = [make_trade_log_row(row, group_col=group_col) for _, row in trades.iterrows()]
+    return pd.DataFrame.from_records(rows, columns=columns)
+
+
+def _resolve_quote_columns(frame: pd.DataFrame) -> tuple[str | None, str | None, str | None, str | None]:
+    bid_col = "bid" if "bid" in frame.columns else ("bid_yes" if "bid_yes" in frame.columns else None)
+    ask_col = "ask" if "ask" in frame.columns else ("ask_yes" if "ask_yes" in frame.columns else None)
+    mid_col = "mid" if "mid" in frame.columns else ("mid_yes" if "mid_yes" in frame.columns else None)
+    spread_col = "spread" if "spread" in frame.columns else ("spread_yes" if "spread_yes" in frame.columns else None)
+    return bid_col, ask_col, mid_col, spread_col
+
+
+def _series_or_default(frame: pd.DataFrame, column: str | None, *, default: Any = np.nan) -> pd.Series:
+    if column is not None and column in frame.columns:
+        return frame[column]
+    return pd.Series(default, index=frame.index)
+
+
+def _coalesce_mid_spread(
+    *,
+    bid: pd.Series,
+    ask: pd.Series,
+    mid_raw: pd.Series,
+    spread_raw: pd.Series,
+) -> tuple[pd.Series, pd.Series]:
+    bid_num = pd.to_numeric(bid, errors="coerce")
+    ask_num = pd.to_numeric(ask, errors="coerce")
+    mid_num = pd.to_numeric(mid_raw, errors="coerce")
+    spread_num = pd.to_numeric(spread_raw, errors="coerce")
+
+    calc_mid = (bid_num + ask_num) / 2.0
+    calc_spread = ask_num - bid_num
+    mid = mid_num.where(mid_num.notna(), calc_mid)
+    spread = spread_num.where(spread_num.notna(), calc_spread)
+    return mid, spread
+
+
+def _build_bars_lookup(bars_df: pd.DataFrame) -> pd.DataFrame:
+    if ("series_id" not in bars_df.columns) or ("time_idx" not in bars_df.columns):
+        return pd.DataFrame()
+
+    lookup = bars_df.copy()
+    lookup["_lookup_time_idx"] = pd.to_numeric(lookup["time_idx"], errors="coerce").astype("Int64")
+    lookup = lookup.dropna(subset=["series_id", "_lookup_time_idx"]).copy()
+    if lookup.empty:
+        return lookup
+
+    if "timestamp" in lookup.columns:
+        lookup = lookup.sort_values("timestamp").copy()
+    lookup = lookup.drop_duplicates(subset=["series_id", "_lookup_time_idx"], keep="last")
+    lookup["_exit_row_exists"] = 1
+    lookup = lookup.set_index(["series_id", "_lookup_time_idx"], drop=False)
+    return lookup
+
+
+def _populate_trade_log_audit_fields(
+    trades: pd.DataFrame,
+    *,
+    bars_df: pd.DataFrame,
+    spec: PolicySpec,
+) -> pd.DataFrame:
+    out = trades.copy()
+    if out.empty:
+        return out
+
+    bid_col, ask_col, mid_col, spread_col = _resolve_quote_columns(out)
+    entry_bid = _series_or_default(out, bid_col)
+    entry_ask = _series_or_default(out, ask_col)
+    entry_mid_raw = _series_or_default(out, mid_col)
+    entry_spread_raw = _series_or_default(out, spread_col)
+    entry_mid, entry_spread = _coalesce_mid_spread(
+        bid=entry_bid,
+        ask=entry_ask,
+        mid_raw=entry_mid_raw,
+        spread_raw=entry_spread_raw,
+    )
+
+    out["entry_timestamp"] = out["timestamp"] if "timestamp" in out.columns else pd.NaT
+    if "time_idx" in out.columns:
+        out["entry_time_idx"] = pd.to_numeric(out["time_idx"], errors="coerce").astype("Int64")
+    else:
+        out["entry_time_idx"] = pd.Series(pd.NA, index=out.index, dtype="Int64")
+    out["entry_bid"] = pd.to_numeric(entry_bid, errors="coerce")
+    out["entry_ask"] = pd.to_numeric(entry_ask, errors="coerce")
+    out["entry_mid"] = entry_mid
+    out["entry_spread"] = entry_spread
+    out["entry_staleness_sec"] = pd.to_numeric(
+        _series_or_default(out, "staleness_sec"),
+        errors="coerce",
+    )
+    out["entry_has_obs"] = _series_or_default(out, "has_obs")
+    out["entry_price_used"] = np.where(
+        out["side"] == "LONG",
+        out["entry_ask"],
+        out["entry_bid"],
+    )
+
+    out["exit_time_idx"] = out["entry_time_idx"] + int(spec.horizon_steps)
+    lookup = _build_bars_lookup(bars_df)
+    series_id_values = _series_or_default(out, "series_id", default=np.nan)
+
+    if not lookup.empty:
+        exit_keys = pd.MultiIndex.from_arrays(
+            [series_id_values, out["exit_time_idx"].astype("Int64")],
+            names=["series_id", "_lookup_time_idx"],
+        )
+        exit_rows = lookup.reindex(exit_keys).copy()
+        exit_rows.index = out.index
+    else:
+        exit_rows = pd.DataFrame(index=out.index)
+
+    exit_bid_col, exit_ask_col, exit_mid_col, exit_spread_col = _resolve_quote_columns(
+        lookup if not lookup.empty else bars_df
+    )
+    exit_bid = _series_or_default(exit_rows, exit_bid_col)
+    exit_ask = _series_or_default(exit_rows, exit_ask_col)
+    exit_mid_raw = _series_or_default(exit_rows, exit_mid_col)
+    exit_spread_raw = _series_or_default(exit_rows, exit_spread_col)
+    exit_mid, exit_spread = _coalesce_mid_spread(
+        bid=exit_bid,
+        ask=exit_ask,
+        mid_raw=exit_mid_raw,
+        spread_raw=exit_spread_raw,
+    )
+
+    has_exit_row = (
+        _series_or_default(exit_rows, "_exit_row_exists", default=0).fillna(0).astype("int64") == 1
+    )
+
+    out["exit_timestamp"] = _series_or_default(exit_rows, "timestamp", default=pd.NaT)
+    out["exit_bid"] = pd.to_numeric(exit_bid, errors="coerce")
+    out["exit_ask"] = pd.to_numeric(exit_ask, errors="coerce")
+    out["exit_mid"] = exit_mid
+    out["exit_spread"] = exit_spread
+    out["exit_staleness_sec"] = pd.to_numeric(
+        _series_or_default(exit_rows, "staleness_sec"),
+        errors="coerce",
+    )
+    exit_has_obs_raw = pd.to_numeric(
+        _series_or_default(exit_rows, "has_obs"),
+        errors="coerce",
+    )
+    out["exit_has_obs"] = exit_has_obs_raw.where(has_exit_row, 0)
+    out["exit_price_used"] = np.where(
+        out["side"] == "LONG",
+        out["exit_bid"],
+        out["exit_ask"],
+    )
+
+    horizon_dt_sec = (
+        pd.to_datetime(out["exit_timestamp"], errors="coerce")
+        - pd.to_datetime(out["entry_timestamp"], errors="coerce")
+    ).dt.total_seconds()
+    out["horizon_dt_sec"] = horizon_dt_sec.where(has_exit_row, None)
+
+    exit_tradable: List[bool] = []
+    for present, bid, ask, spread, staleness, has_obs in zip(
+        has_exit_row.tolist(),
+        out["exit_bid"],
+        out["exit_ask"],
+        out["exit_spread"],
+        out["exit_staleness_sec"],
+        out["exit_has_obs"],
+    ):
+        if not present:
+            exit_tradable.append(False)
+            continue
+        exit_tradable.append(
+            _row_tradable_with_thresholds(
+                bid=bid,
+                ask=ask,
+                spread=spread,
+                staleness_sec=staleness,
+                has_obs=has_obs,
+                max_spread=spec.max_spread,
+                max_staleness_sec=spec.max_staleness_sec,
+                require_has_obs=spec.require_has_obs,
+            )
+        )
+    out["exit_tradable"] = exit_tradable
+    return out
+
+
 def backtest_policy(
     df: pd.DataFrame,
     models: dict,
@@ -561,49 +822,8 @@ def backtest_policy(
 ) -> Tuple[pd.DataFrame, dict]:
     fee_per_trade = float(spec.fee_per_trade)
     split_label = split_name or str(df.attrs.get("split_name", "unknown"))
-    debug = os.getenv("POLICY_DEBUG") in ("1", "true", "TRUE", "yes", "YES")
     if df.empty:
-        empty_log = pd.DataFrame(
-            columns=[
-                "timestamp",
-                "ticker",
-                spec.group_key,
-                "series_id",
-                "time_idx",
-                "side",
-                "pred_long",
-                "pred_short",
-                "pred_edge",
-                "realized_pnl",
-                "realized_pnl_gross",
-                "realized_pnl_net",
-                "pnl_conservative_gross",
-                "pnl_conservative_net",
-                "spread",
-                "staleness_sec",
-                "has_obs",
-                "entry_timestamp",
-                "entry_time_idx",
-                "entry_bid",
-                "entry_ask",
-                "entry_mid",
-                "entry_spread",
-                "entry_staleness_sec",
-                "entry_has_obs",
-                "entry_price_used",
-                "exit_timestamp",
-                "exit_time_idx",
-                "exit_bid",
-                "exit_ask",
-                "exit_mid",
-                "exit_spread",
-                "exit_staleness_sec",
-                "exit_has_obs",
-                "exit_price_used",
-                "horizon_dt_sec",
-                "exit_tradable",
-            ]
-        )
+        empty_log = _build_trade_log_frame(pd.DataFrame(), group_col=spec.group_key)
         metrics = _trade_metrics(n_rows=0, n_candidates=0, trades=empty_log)
         metrics.update(
             {
@@ -623,8 +843,6 @@ def backtest_policy(
                 "oracle_hit_rate_net": float("nan"),
             }
         )
-        if debug and run_dir is not None:
-            _write_debug_top_winners(run_dir=run_dir, split_name=split_label, trade_log=empty_log)
         return empty_log, metrics
 
     eval_df = df.copy()
@@ -680,46 +898,6 @@ def backtest_policy(
         enforce_cooldown=spec.enforce_group_cooldown,
     )
 
-    keep_cols = [
-        "timestamp",
-        "ticker",
-        group_col,
-        "series_id",
-        "time_idx",
-        "side",
-        "pred_long",
-        "pred_short",
-        "pred_edge",
-        "realized_pnl",
-        "realized_pnl_gross",
-        "realized_pnl_net",
-        "pnl_conservative_gross",
-        "pnl_conservative_net",
-        "spread",
-        "staleness_sec",
-        "has_obs",
-        "entry_timestamp",
-        "entry_time_idx",
-        "entry_bid",
-        "entry_ask",
-        "entry_mid",
-        "entry_spread",
-        "entry_staleness_sec",
-        "entry_has_obs",
-        "entry_price_used",
-        "exit_timestamp",
-        "exit_time_idx",
-        "exit_bid",
-        "exit_ask",
-        "exit_mid",
-        "exit_spread",
-        "exit_staleness_sec",
-        "exit_has_obs",
-        "exit_price_used",
-        "horizon_dt_sec",
-        "exit_tradable",
-    ]
-
     if selected.empty:
         trade_log = selected.copy()
     else:
@@ -731,106 +909,7 @@ def backtest_policy(
         )
         selected["realized_pnl_net"] = _apply_fee_per_trade(selected["realized_pnl_gross"], fee_per_trade)
         selected["realized_pnl"] = selected["realized_pnl_net"]
-        selected["entry_timestamp"] = selected["timestamp"] if "timestamp" in selected.columns else pd.NaT
-        if "time_idx" in selected.columns:
-            selected["entry_time_idx"] = pd.to_numeric(selected["time_idx"], errors="coerce").astype("Int64")
-        else:
-            selected["entry_time_idx"] = pd.Series(pd.NA, index=selected.index, dtype="Int64")
-        selected["entry_bid"] = selected["bid"] if "bid" in selected.columns else np.nan
-        selected["entry_ask"] = selected["ask"] if "ask" in selected.columns else np.nan
-        selected["entry_mid"] = selected["mid"] if "mid" in selected.columns else np.nan
-        selected["entry_spread"] = selected["spread"] if "spread" in selected.columns else np.nan
-        selected["entry_staleness_sec"] = (
-            selected["staleness_sec"] if "staleness_sec" in selected.columns else np.nan
-        )
-        selected["entry_has_obs"] = selected["has_obs"] if "has_obs" in selected.columns else np.nan
-        selected["entry_price_used"] = np.where(
-            selected["side"] == "LONG",
-            selected["entry_ask"],
-            selected["entry_bid"],
-        )
-
-        selected["exit_time_idx"] = selected["entry_time_idx"] + int(spec.horizon_steps)
-        series_key_col = "series_id" if "series_id" in selected.columns else group_col
-        lookup_cols = ["timestamp", "bid", "ask", "mid", "spread", "staleness_sec", "has_obs"]
-        if (
-            (series_key_col in selected.columns)
-            and (series_key_col in eval_df.columns)
-            and ("time_idx" in eval_df.columns)
-        ):
-            exit_lookup = eval_df[[series_key_col, "time_idx"] + [c for c in lookup_cols if c in eval_df.columns]].copy()
-            exit_lookup["_exit_time_idx_key"] = pd.to_numeric(
-                exit_lookup["time_idx"], errors="coerce"
-            ).astype("Int64")
-            exit_lookup = exit_lookup.drop(columns=["time_idx"])
-            exit_lookup = exit_lookup.drop_duplicates(subset=[series_key_col, "_exit_time_idx_key"], keep="last")
-            exit_lookup = exit_lookup.rename(columns={c: f"_exit_{c}" for c in lookup_cols if c in exit_lookup.columns})
-
-            selected["_exit_time_idx_key"] = selected["exit_time_idx"].astype("Int64")
-            selected = selected.merge(
-                exit_lookup,
-                how="left",
-                on=[series_key_col, "_exit_time_idx_key"],
-                sort=False,
-            )
-            selected = selected.drop(columns=["_exit_time_idx_key"])
-
-        if "bid_fwd_h" in selected.columns:
-            selected["exit_bid"] = selected["bid_fwd_h"]
-        elif "_exit_bid" in selected.columns:
-            selected["exit_bid"] = selected["_exit_bid"]
-        else:
-            selected["exit_bid"] = np.nan
-
-        if "ask_fwd_h" in selected.columns:
-            selected["exit_ask"] = selected["ask_fwd_h"]
-        elif "_exit_ask" in selected.columns:
-            selected["exit_ask"] = selected["_exit_ask"]
-        else:
-            selected["exit_ask"] = np.nan
-
-        if "mid_fwd_h" in selected.columns:
-            selected["exit_mid"] = selected["mid_fwd_h"]
-        elif "_exit_mid" in selected.columns:
-            selected["exit_mid"] = selected["_exit_mid"]
-        else:
-            selected["exit_mid"] = np.nan
-
-        if "timestamp_fwd_h" in selected.columns:
-            selected["exit_timestamp"] = selected["timestamp_fwd_h"]
-        elif "_exit_timestamp" in selected.columns:
-            selected["exit_timestamp"] = selected["_exit_timestamp"]
-        else:
-            selected["exit_timestamp"] = pd.NaT
-
-        if "spread_fwd_h" in selected.columns:
-            selected["exit_spread"] = selected["spread_fwd_h"]
-        elif ("bid_fwd_h" in selected.columns) and ("ask_fwd_h" in selected.columns):
-            selected["exit_spread"] = selected["ask_fwd_h"] - selected["bid_fwd_h"]
-        elif "_exit_spread" in selected.columns:
-            selected["exit_spread"] = selected["_exit_spread"]
-        else:
-            selected["exit_spread"] = selected["exit_ask"] - selected["exit_bid"]
-
-        if "staleness_sec_fwd_h" in selected.columns:
-            selected["exit_staleness_sec"] = selected["staleness_sec_fwd_h"]
-        elif "_exit_staleness_sec" in selected.columns:
-            selected["exit_staleness_sec"] = selected["_exit_staleness_sec"]
-        else:
-            selected["exit_staleness_sec"] = np.nan
-
-        if "has_obs_fwd_h" in selected.columns:
-            selected["exit_has_obs"] = selected["has_obs_fwd_h"]
-        elif "_exit_has_obs" in selected.columns:
-            selected["exit_has_obs"] = selected["_exit_has_obs"]
-        else:
-            selected["exit_has_obs"] = np.nan
-
-        selected["exit_price_used"] = np.where(
-            selected["side"] == "LONG",
-            selected["exit_bid"],
-            selected["exit_ask"],
-        )
+        selected = _populate_trade_log_audit_fields(selected, bars_df=eval_df, spec=spec)
         selected["pnl_conservative_gross"] = np.where(
             selected["side"] == "LONG",
             selected["exit_bid"] - selected["entry_ask"],
@@ -840,37 +919,9 @@ def backtest_policy(
             selected["pnl_conservative_gross"],
             fee_per_trade,
         )
-        selected["horizon_dt_sec"] = (
-            pd.to_datetime(selected["exit_timestamp"], errors="coerce")
-            - pd.to_datetime(selected["entry_timestamp"], errors="coerce")
-        ).dt.total_seconds()
-
-        selected["exit_tradable"] = [
-            is_tradable(
-                spread=spread,
-                staleness_sec=staleness,
-                has_obs=has_obs,
-                max_spread=spec.max_spread,
-                max_staleness_sec=spec.max_staleness_sec,
-                require_has_obs=spec.require_has_obs,
-            )
-            for spread, staleness, has_obs in zip(
-                selected["exit_spread"],
-                selected["exit_staleness_sec"],
-                selected["exit_has_obs"],
-            )
-        ]
-        temp_exit_cols = [c for c in selected.columns if c.startswith("_exit_")]
-        if temp_exit_cols:
-            selected = selected.drop(columns=temp_exit_cols)
         trade_log = selected.copy()
 
-    for c in keep_cols:
-        if c not in trade_log.columns:
-            trade_log[c] = np.nan
-    trade_log = trade_log[keep_cols].copy()
-    if debug and run_dir is not None:
-        _write_debug_top_winners(run_dir=run_dir, split_name=split_label, trade_log=trade_log)
+    trade_log = _build_trade_log_frame(trade_log, group_col=group_col)
 
     metrics = _trade_metrics(
         n_rows=len(eval_df),
@@ -1015,6 +1066,7 @@ def save_policy_run(
 ) -> None:
     run_dir = Path(run_dir).expanduser().resolve()
     run_dir.mkdir(parents=True, exist_ok=True)
+    debug_enabled = os.getenv("POLICY_DEBUG") == "1"
 
     (run_dir / "spec.json").write_text(
         json.dumps(asdict(spec), indent=2, sort_keys=True, default=str)
@@ -1028,6 +1080,12 @@ def save_policy_run(
     for split_name, trade_log in trade_logs.items():
         out_path = run_dir / f"trade_logs_{split_name}.csv"
         trade_log.to_csv(out_path, index=False)
+        if debug_enabled and not trade_log.empty:
+            _write_debug_top_winners(
+                run_dir=run_dir,
+                split_name=split_name,
+                trade_log=trade_log,
+            )
 
     readme = (
         "Policy run artifacts\n"
